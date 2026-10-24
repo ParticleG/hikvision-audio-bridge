@@ -1,0 +1,18 @@
+[Unit]
+Description=Hikvision camera speaker and microphone bridge
+After=pipewire-pulse.service
+Requires=pipewire-pulse.service
+PartOf=pipewire-pulse.service
+
+[Service]
+Type=notify
+ExecStart=%h/.local/bin/hikvision-audio serve
+ExecStopPost=%h/.local/bin/hikvision-audio cleanup
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=20
+UMask=0077
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target

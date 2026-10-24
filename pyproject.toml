@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hikvision-audio-bridge"
+version = "0.1.0"
+description = "Expose a Hikvision intercom as Linux PipeWire audio devices"
+requires-python = ">=3.13"
+dependencies = [
+  "audioop-lts>=0.2.2",
+  "h11>=0.16,<1",
+  "httpx>=0.28.1,<1",
+  "secretstorage>=3.3.3,<4",
+]
+
+[project.scripts]
+hikvision-audio = "hikvision_audio_bridge.cli:main"
+
+[dependency-groups]
+dev = ["ruff>=0.12", "ty>=0.0.1"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hikvision_audio_bridge"]
