@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="Configure camera audio routing and text-to-speech for the local Hikvision audio bridge.">
+  <title>Hikvision Audio Bridge</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to main content</a>
+
+  <header class="page-header">
+    <div class="brand">
+      <p class="eyebrow">Local audio routing</p>
+      <h1>Hikvision Audio Bridge</h1>
+      <p class="lede">Route audio between cameras and virtual PipeWire speaker and microphone devices.</p>
+    </div>
+    <div id="session-tools" class="session-tools" hidden>
+      <span class="session-pill">Authorized session</span>
+      <button type="button" class="button button-quiet" id="sign-out">Sign out</button>
+    </div>
+  </header>
+
+  <main id="main-content" class="page-main">
+    <section id="login-panel" class="panel login-panel" aria-labelledby="login-heading">
+      <h2 id="login-heading">Sign in</h2>
+      <p>The launch command normally opens this page with an access token. You can also paste the token from the private <code>web-access.json</code> runtime file.</p>
+      <p class="hint">All API requests require this token, even on the local machine. It is kept only in this tab's session storage.</p>
+      <form id="login-form" method="post" action="/" novalidate>
+        <div class="field">
+          <label for="login-token">Access token</label>
+          <input id="login-token" name="token" type="password" autocomplete="off" autocapitalize="none" spellcheck="false" required>
+        </div>
+        <div class="form-actions">
+          <button type="submit" class="button button-primary" id="login-submit">Sign in</button>
+        </div>
+        <p id="login-status" class="hint" role="status"></p>
+        <p id="login-error" class="field-error" role="alert" hidden></p>
+      </form>
+    </section>
+
+    <div id="app" class="dashboard" hidden>
+      <div class="status-stack">
+        <p id="app-error" class="alert alert-error" role="alert" hidden></p>
+        <p id="app-notice" class="alert alert-success" role="status" hidden></p>
+        <p id="live-warning" class="alert alert-warning" role="status" hidden></p>
+      </div>
+
+      <section class="panel" aria-labelledby="cameras-heading">
+        <div class="section-header">
+          <div>
+            <h2 id="cameras-heading" tabindex="-1">Cameras</h2>
+            <p class="section-intro">Camera connections are independent. Saves reconnect only the affected camera.</p>
+            <p id="camera-summary" class="hint" role="status">No cameras configured.</p>
+          </div>
+          <button type="button" class="button button-secondary" id="camera-new">Add camera</button>
+        </div>
+
+        <div id="camera-list" class="entity-list">
+          <p class="empty-state">No cameras configured yet.</p>
+        </div>
+
+        <form id="camera-form" class="editor" method="post" action="/" aria-labelledby="camera-editor-heading" novalidate>
+          <div class="editor-header">
+            <h3 id="camera-editor-heading">Add camera</h3>
+            <p class="hint">Camera IDs cannot be changed after creation.</p>
+          </div>
+          <input type="hidden" id="camera-edit-id" value="">
+          <div class="form-grid">
+            <div class="field">
+              <label for="camera-id">Camera ID</label>
+              <input id="camera-id" name="id" type="text" maxlength="48" pattern="[a-z][a-z0-9_-]{0,47}" placeholder="front-door" autocomplete="off" autocapitalize="none" spellcheck="false" required aria-describedby="camera-id-hint">
+              <p id="camera-id-hint" class="hint">Start with a lowercase letter; use lowercase letters, digits, underscores, or hyphens.</p>
+            </div>
+            <div class="field">
+              <label for="camera-url">Camera URL</label>
+              <input id="camera-url" name="url" type="url" placeholder="http://192.0.2.10" autocomplete="off" autocapitalize="none" spellcheck="false" required aria-describedby="camera-url-hint">
+              <p id="camera-url-hint" class="hint">HTTP or HTTPS origin only, without a path or embedded credentials.</p>
+            </div>
+            <div class="field">
+              <label for="camera-username">Username</label>
+              <input id="camera-username" name="username" type="text" autocomplete="off" autocapitalize="none" spellcheck="false" required>
+            </div>
+            <div class="field">
+              <label for="camera-channel">Channel</label>
+              <input id="camera-channel" name="channel" type="number" min="1" max="65535" step="1" value="1" required>
+            </div>
+            <div class="field field-span">
+              <label for="camera-password">Password <span class="optional">(optional)</span></label>
+              <input id="camera-password" name="password" type="password" autocomplete="new-password" aria-describedby="camera-password-hint">
+              <p id="camera-password-hint" class="hint">Stored in the system Secret Service; never displayed or returned. When editing, leave blank to keep the existing password.</p>
+            </div>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="button button-primary" id="camera-submit">Save camera</button>
+            <button type="button" class="button button-secondary" id="camera-cancel" hidden>Cancel edit</button>
+            <button type="button" class="button button-quiet" id="camera-clear">Clear form</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel" aria-labelledby="devices-heading">
+        <div class="section-header">
+          <div>
+            <h2 id="devices-heading">Local devices</h2>
+            <p class="section-intro">Each virtual device has its own switch and can route one or more cameras.</p>
+            <p id="device-summary" class="hint" role="status">No devices configured.</p>
+          </div>
+          <button type="button" class="button button-secondary" id="device-new">Add device</button>
+        </div>
+
+        <div id="device-list" class="entity-list">
+          <p class="empty-state">No virtual devices configured yet.</p>
+        </div>
+
+        <form id="device-form" class="editor" method="post" action="/" aria-labelledby="device-editor-heading" novalidate>
+          <div class="editor-header">
+            <h3 id="device-editor-heading">Add device</h3>
+            <p class="hint">Device IDs cannot be changed after creation.</p>
+          </div>
+          <input type="hidden" id="device-edit-id" value="">
+          <div class="form-grid">
+            <div class="field">
+              <label for="device-id">Device ID</label>
+              <input id="device-id" name="id" type="text" maxlength="48" pattern="[a-z][a-z0-9_-]{0,47}" placeholder="living-room" autocomplete="off" autocapitalize="none" spellcheck="false" required aria-describedby="device-id-hint">
+              <p id="device-id-hint" class="hint">Start with a lowercase letter; use lowercase letters, digits, underscores, or hyphens.</p>
+            </div>
+            <div class="field">
+              <label for="device-name">Display name</label>
+              <input id="device-name" name="name" type="text" maxlength="100" placeholder="Living room speaker" required>
+            </div>
+            <div class="field">
+              <label for="device-direction">Direction</label>
+              <select id="device-direction" name="direction" required>
+                <option value="speaker">Speaker: send local playback audio to cameras</option>
+                <option value="microphone">Microphone: expose camera audio as a local microphone</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="device-cameras">Camera routes</label>
+              <select id="device-cameras" name="cameras" multiple size="6" aria-describedby="device-cameras-hint"></select>
+              <p id="device-cameras-hint" class="hint">Select one or more cameras. Hold Ctrl on Windows/Linux or Command on macOS to select multiple routes; leave empty to create the device without routes.</p>
+            </div>
+            <div class="field field-span">
+              <label class="checkbox-label" for="device-enabled">
+                <input id="device-enabled" name="enabled" type="checkbox" checked>
+                Enable this device
+              </label>
+            </div>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="button button-primary" id="device-submit">Save device</button>
+            <button type="button" class="button button-secondary" id="device-cancel" hidden>Cancel edit</button>
+            <button type="button" class="button button-quiet" id="device-clear">Clear form</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="panel panel-full" aria-labelledby="tts-heading">
+        <div class="section-header">
+          <div>
+            <h2 id="tts-heading">Text to speech</h2>
+            <p class="section-intro">Synthesize short text and send it to the cameras routed by selected enabled speaker devices.</p>
+          </div>
+          <span id="tts-state" class="badge badge-idle" role="status">Idle</span>
+        </div>
+
+        <p class="notice notice-online"><strong>Online service:</strong> speech text is sent to Microsoft's Edge TTS service to synthesize audio. Do not enter sensitive information. The bridge does not save the text or return it in status.</p>
+        <p id="tts-error" class="alert alert-error" role="alert" hidden></p>
+        <p id="tts-active-targets" class="hint">Active targets: none</p>
+
+        <form id="tts-form" method="post" action="/" novalidate>
+          <div class="field">
+            <label for="tts-text">Speech text</label>
+            <textarea id="tts-text" name="text" rows="4" maxlength="2000" placeholder="Enter the message to speak." required aria-describedby="tts-text-hint"></textarea>
+            <div class="field-footer">
+              <p id="tts-text-hint" class="hint">Up to 2,000 characters. Text is not saved in the device settings or status.</p>
+              <p class="char-count"><span id="tts-count">0</span> / 2000</p>
+            </div>
+          </div>
+          <div class="form-grid">
+            <div class="field">
+              <label for="tts-voice">Voice</label>
+              <input id="tts-voice" name="voice" type="text" value="zh-CN-XiaoxiaoNeural" maxlength="100" list="tts-voices" autocomplete="off" autocapitalize="none" spellcheck="false" required aria-describedby="tts-voice-hint">
+              <datalist id="tts-voices">
+                <option value="zh-CN-XiaoxiaoNeural"></option>
+                <option value="zh-CN-YunxiNeural"></option>
+                <option value="zh-CN-YunjianNeural"></option>
+                <option value="zh-TW-HsiaoChenNeural"></option>
+                <option value="en-US-AvaNeural"></option>
+                <option value="en-US-AndrewNeural"></option>
+              </datalist>
+              <p id="tts-voice-hint" class="hint">Use any valid Edge TTS voice short name.</p>
+            </div>
+            <div class="field">
+              <label for="tts-targets-select">Speaker devices</label>
+              <select id="tts-targets-select" name="devices" multiple size="5" required aria-describedby="tts-targets-hint"></select>
+              <p id="tts-targets-hint" class="hint">Only enabled speaker devices are listed. Speech is sent to the cameras they route to.</p>
+            </div>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="button button-primary" id="tts-speak">Speak</button>
+            <button type="button" class="button button-danger" id="tts-stop">Stop speech</button>
+          </div>
+        </form>
+      </section>
+    </div>
+
+    <noscript>
+      <p class="alert alert-warning">This WebUI requires JavaScript. Enable JavaScript to sign in and manage the bridge.</p>
+    </noscript>
+  </main>
+
+  <footer class="page-footer">
+    <p>Local daemon interface. Access tokens are generated for each daemon run. LAN access requires TLS configured by the service operator.</p>
+  </footer>
+</body>
+</html>
