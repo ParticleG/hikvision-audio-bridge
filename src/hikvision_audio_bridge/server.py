@@ -29,6 +29,7 @@ from .tts import DEFAULT_VOICE, _validate_text, _validate_voice, synthesize
 from .vault import ServerSecrets
 
 MAX_QUEUED_SPEECH = 10
+MAX_COMPLETED_SPEECH = 64
 MAX_PENDING_CONTROL = 32
 
 
@@ -145,8 +146,34 @@ class SpeechQueue:
         self.worker: asyncio.Task | None = None
         self.playing: asyncio.Task | None = None
         self.stage = "idle"
-        self.last: dict | None = None
+        self.completed: dict[str, dict] = {}
         self.closing = False
+
+    @property
+    def last(self) -> dict | None:
+        return next(reversed(self.completed.values()), None)
+
+    def job_status(self, identifier: str) -> dict:
+        if not isinstance(identifier, str):
+            raise ValueError("Speech job ID must be a string")
+        if self.current is not None and self.current.identifier == identifier:
+            return {
+                **self.current.public(),
+                "state": self.status()["state"],
+                "error": None,
+            }
+        for job in self.pending:
+            if job.identifier == identifier:
+                return {**job.public(), "state": "queued", "error": None}
+        result = self.completed.get(identifier)
+        if result is None:
+            raise ValueError("Unknown or expired speech job")
+        return result
+
+    def _remember(self, result: dict) -> None:
+        self.completed[result["id"]] = result
+        if len(self.completed) > MAX_COMPLETED_SPEECH:
+            del self.completed[next(iter(self.completed))]
 
     def status(self) -> dict:
         stage = self.stage
@@ -185,7 +212,6 @@ class SpeechQueue:
         )
 
     async def _play(self, job: SpeechJob) -> None:
-        self.stage = "synthesizing"
         pcm = await synthesize(job.text, job.voice)
         self.stage = "playing"
         await self.engine.play_pcm(pcm, job.cameras)
@@ -195,15 +221,16 @@ class SpeechQueue:
             while self.pending and not self.closing:
                 job = self.pending.popleft()
                 self.current = job
+                self.stage = "synthesizing"
                 self.playing = asyncio.create_task(self._play(job))
                 result = {**job.public(), "state": "completed", "error": None}
                 try:
                     await self.playing
                 except asyncio.CancelledError:
+                    result["state"] = "cancelled"
                     current = asyncio.current_task()
                     if current is not None and current.cancelling():
                         raise
-                    result["state"] = "cancelled"
                 except Exception as error:
                     message = str(error) or type(error).__name__
                     result.update(
@@ -211,7 +238,7 @@ class SpeechQueue:
                         error=message.replace(job.text, "[redacted]")[:1000],
                     )
                 finally:
-                    self.last = result
+                    self._remember(result)
                     self.current = None
                     self.playing = None
                     self.stage = "idle"
@@ -219,12 +246,16 @@ class SpeechQueue:
             self.worker = None
 
     async def cancel(self, identifier: str) -> None:
+        if not isinstance(identifier, str):
+            raise ValueError("Speech job ID must be a string")
         for job in self.pending:
             if job.identifier == identifier:
                 self.pending.remove(job)
-                self.last = {**job.public(), "state": "cancelled", "error": None}
+                self._remember({**job.public(), "state": "cancelled", "error": None})
                 return
         if self.current is None or self.current.identifier != identifier:
+            if identifier in self.completed:
+                return
             raise ValueError("Unknown speech job")
         task = self.playing
         if task is not None:
@@ -233,7 +264,9 @@ class SpeechQueue:
             await asyncio.shield(_finish(task))
 
     async def stop(self) -> None:
-        self.pending.clear()
+        while self.pending:
+            job = self.pending.popleft()
+            self._remember({**job.public(), "state": "cancelled", "error": None})
         task = self.playing
         if task is not None and not task.done() and not task.cancelling():
             task.cancel()
@@ -308,6 +341,8 @@ class Gateway:
         operation = command.get("op")
         if operation == "status" and set(command) == {"op"}:
             return self.status()
+        if operation == "tts.get" and set(command) == {"op", "id"}:
+            return self.speech.job_status(command["id"])
         if operation == "session.disconnect" and set(command) == {"op", "id"}:
             session = self.sessions.get(command["id"])
             if session is None:

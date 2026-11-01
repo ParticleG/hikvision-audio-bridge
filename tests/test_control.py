@@ -8,7 +8,11 @@ from unittest.mock import patch
 
 from hikvision_audio_bridge.config import Camera, Paths
 from hikvision_audio_bridge.desktop import DesktopBridge
-from hikvision_audio_bridge.server import MAX_QUEUED_SPEECH, Gateway
+from hikvision_audio_bridge.server import (
+    MAX_COMPLETED_SPEECH,
+    MAX_QUEUED_SPEECH,
+    Gateway,
+)
 from hikvision_audio_bridge.tts import DEFAULT_VOICE
 from hikvision_audio_bridge.vault import ServerSecrets
 
@@ -164,10 +168,10 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
         queue = self.bridge.speech
         text = "private queued announcement"
         with patch("hikvision_audio_bridge.server.synthesize", new=provider):
-            queue.enqueue(text, ["front"], DEFAULT_VOICE)
+            identifiers = [queue.enqueue(text, ["front"], DEFAULT_VOICE)]
             await asyncio.wait_for(started.wait(), 3)
             for _ in range(MAX_QUEUED_SPEECH):
-                queue.enqueue(text, ["front"], DEFAULT_VOICE)
+                identifiers.append(queue.enqueue(text, ["front"], DEFAULT_VOICE))
             with self.assertRaises(ValueError):
                 queue.enqueue(text, ["front"], DEFAULT_VOICE)
             self.assertNotIn(text, json.dumps(self.bridge.status()))
@@ -176,6 +180,76 @@ class ControlTests(unittest.IsolatedAsyncioTestCase):
             await queue.stop()
         self.assertEqual(queue.status()["queue"], [])
         self.assertNotIn(text, (self.paths.config / "settings.json").read_text())
+        for identifier in identifiers:
+            receipt = await self.bridge.dispatch({"op": "tts.get", "id": identifier})
+            self.assertEqual(receipt["state"], "cancelled")
+            self.assertNotIn(text, json.dumps(receipt))
+
+    async def test_cancelled_terminal_job_does_not_cancel_another_active_job(self):
+        await self.save()
+        started = asyncio.Event()
+
+        async def provider(text, _voice):
+            if text == "first":
+                raise RuntimeError("Provider unavailable")
+            started.set()
+            await asyncio.Event().wait()
+
+        queue = self.bridge.speech
+        with patch("hikvision_audio_bridge.server.synthesize", new=provider):
+            first = queue.enqueue("first", ["front"], DEFAULT_VOICE)
+            await queue.worker
+            second = queue.enqueue("second", ["front"], DEFAULT_VOICE)
+            await asyncio.wait_for(started.wait(), 3)
+            await queue.cancel(first)
+            self.assertEqual(queue.job_status(first)["state"], "error")
+            self.assertEqual(queue.job_status(second)["state"], "synthesizing")
+            with self.assertRaises(ValueError):
+                await queue.cancel("missing")
+            self.assertEqual(queue.current.identifier, second)
+            await queue.stop()
+        self.assertEqual(queue.job_status(second)["state"], "cancelled")
+        self.assertEqual(queue.job_status(first)["state"], "error")
+
+    async def test_expired_speech_receipt_is_not_reported_as_success(self):
+        await self.save()
+        text = "private announcement"
+
+        async def provider(phrase, _voice):
+            raise RuntimeError(phrase)
+
+        queue = self.bridge.speech
+        identifiers = []
+        with patch("hikvision_audio_bridge.server.synthesize", new=provider):
+            for _ in range(MAX_COMPLETED_SPEECH + 1):
+                identifiers.append(queue.enqueue(text, ["front"], DEFAULT_VOICE))
+                await queue.worker
+        with self.assertRaises(ValueError):
+            await self.bridge.dispatch({"op": "tts.get", "id": identifiers[0]})
+        for identifier in (identifiers[1], identifiers[-1]):
+            receipt = await self.bridge.dispatch({"op": "tts.get", "id": identifier})
+            self.assertEqual(receipt["state"], "error")
+            self.assertNotIn(text, json.dumps(receipt))
+            self.assertNotIn("text", receipt)
+        self.assertEqual(queue.status()["last"]["id"], identifiers[-1])
+
+    async def test_current_speech_has_a_state_before_provider_starts(self):
+        await self.save()
+
+        async def provider(_text, _voice):
+            await asyncio.Event().wait()
+
+        loop = asyncio.get_running_loop()
+        observed = loop.create_future()
+        queue = self.bridge.speech
+        with patch("hikvision_audio_bridge.server.synthesize", new=provider):
+            identifier = queue.enqueue("announcement", ["front"], DEFAULT_VOICE)
+            loop.call_soon(
+                lambda: observed.set_result(queue.job_status(identifier)["state"])
+            )
+            state = await observed
+            await queue.stop()
+        self.assertEqual(state, "synthesizing")
 
     async def test_speech_failure_redacts_announcement_text(self):
         await self.save()

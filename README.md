@@ -225,6 +225,20 @@ convert MP3 to PCM16. Text and synthesized audio are kept in memory, never audio
 - Status exposes job IDs, targets, voices and outcomes, not announcement text.
   Completion tracks camera-transport consumption, not the camera's internal speaker buffer.
 
+Automation clients can use `POST /api/command` with `{"op":"tts.get","id":"JOB_ID"}`
+and the admin bearer token to follow one queued job (server 0.2.1 or newer).
+The response's `status` contains `id`, `cameras`, `voice`, `state` and nullable `error`.
+States are `queued`, `synthesizing`, `connecting`, `playing`, `completed`, `error`
+and `cancelled`. Do not infer completion from enqueue acknowledgement or `tts.last`.
+The latest 64 terminal results remain in memory; unknown, expired or pre-restart IDs
+return an error, never an assumed success. Cancelling a known terminal job is a
+no-op; stopping the queue records cancellation for waiting jobs as well.
+
+The TypeScript package `hikvision-audio-bridge-client` provides management, per-job
+TTS completion and audio-scoped WebSocket clients for Node.js and Bun. Its source
+and packaging commands live in the wedeep-lark `packages/hikvision-audio-bridge-client`
+workspace; an npm registry publication is not required for workspace or tarball use.
+
 ## Storage, migration and recovery
 
 **Server:** `ServerSettings` stores only cameras and listener settings, with mode

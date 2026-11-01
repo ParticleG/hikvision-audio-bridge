@@ -214,18 +214,44 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
 
         queue = self.gateway.speech
         with patch("hikvision_audio_bridge.server.synthesize", new=provider):
-            queue.enqueue("first", ["front"], DEFAULT_VOICE)
+            first_id = queue.enqueue("first", ["front"], DEFAULT_VOICE)
             await asyncio.wait_for(started.wait(), 3)
             cancelled = queue.enqueue("cancelled", ["front"], DEFAULT_VOICE)
-            queue.enqueue("second", ["front"], DEFAULT_VOICE)
+            second_id = queue.enqueue("second", ["front"], DEFAULT_VOICE)
             await queue.cancel(cancelled)
             release.set()
             await asyncio.wait_for(queue.worker, 3)
         self.assertEqual(calls, ["first", "second"])
-        data = bytes(self.front.received)
         first = audioop.lin2alaw(pcm(9000), 2)
         second = audioop.lin2alaw(pcm(14000), 2)
-        self.assertEqual(data.count(first), 3)
-        self.assertEqual(data.count(second), 3)
+        unmixed_first = audioop.lin2alaw(pcm(15000), 2)
+        unmixed_second = audioop.lin2alaw(pcm(25000), 2)
+        async with asyncio.timeout(3):
+            while (
+                self.front.received.count(second)
+                + self.front.received.count(unmixed_second)
+                < 3
+            ):
+                self.front.received_audio.clear()
+                await self.front.received_audio.wait()
+        data = bytes(self.front.received)
+        # A live frame can miss a mix tick; the speech must still be complete.
+        self.assertEqual(data.count(first) + data.count(unmixed_first), 3)
+        self.assertEqual(data.count(second) + data.count(unmixed_second), 3)
         self.assertLess(data.index(first), data.index(second))
         self.assertEqual((self.front.opened, self.front.closed), (1, 0))
+        async with aiohttp.ClientSession(trust_env=False) as client:
+            for identifier, expected in (
+                (first_id, "completed"),
+                (cancelled, "cancelled"),
+                (second_id, "completed"),
+            ):
+                async with client.post(
+                    self.web.url + "/api/command",
+                    headers={"Authorization": f"Bearer {self.gateway.admin_token}"},
+                    json={"op": "tts.get", "id": identifier},
+                ) as response:
+                    self.assertEqual(response.status, 200, await response.text())
+                    receipt = (await response.json())["status"]
+                    self.assertEqual(receipt["id"], identifier)
+                    self.assertEqual(receipt["state"], expected)
