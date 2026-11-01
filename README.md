@@ -65,6 +65,12 @@ container's address. Keep code and the virtual environment readable but not
 writable by the service account. The unit uses private state/runtime directories,
 `NoNewPrivileges`, a read-only system view and no desktop device access.
 
+To update, replace every checkout file except `.venv` with the new source, rerun
+the same `uv sync` command, then restart `hikvision-audio-server.service`. Do not
+install a wheel into `.venv` alone: the stale checkout would make the next `uv sync`
+reinstall the older version. A server restart disconnects desktops; each reports
+`Backend disconnected; reconnect explicitly` until `hikvision-audio reconnect` runs.
+
 For a non-system installation, choose writable private directories explicitly:
 
 ```sh
