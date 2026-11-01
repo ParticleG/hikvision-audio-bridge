@@ -1,4 +1,4 @@
-"""Authenticated, same-origin configuration UI for the local audio bridge."""
+"""Authenticated management UIs and separately scoped network audio access."""
 
 import ipaddress
 import json
@@ -9,6 +9,7 @@ import tempfile
 from collections.abc import Awaitable, Callable
 from importlib.resources import files
 from pathlib import Path
+from typing import Protocol
 from urllib.parse import urlsplit
 
 from aiohttp import web
@@ -34,6 +35,7 @@ _STATIC = {
     "/": ("index.html", "text/html"),
     "/index.html": ("index.html", "text/html"),
     "/app.js": ("app.js", "text/javascript"),
+    "/common.js": ("common.js", "text/javascript"),
     "/style.css": ("style.css", "text/css"),
 }
 
@@ -64,6 +66,14 @@ def _origin(value: str) -> tuple[str, str, int]:
     return parsed.scheme, parsed.hostname.casefold(), port
 
 
+class AudioAPI(Protocol):
+    access_token: str
+
+    def catalog(self) -> dict: ...
+
+    async def websocket(self, request: web.Request) -> web.StreamResponse: ...
+
+
 class WebServer:
     """Serve packaged assets and forward authenticated commands to one executor."""
 
@@ -72,10 +82,19 @@ class WebServer:
         paths: Paths,
         settings: WebSettings,
         execute: Callable[[object], Awaitable[dict]],
+        *,
+        component: str = "desktop",
+        token: str | None = None,
+        audio: AudioAPI | None = None,
     ) -> None:
         self.paths = paths
         self.settings = settings
         self.execute = execute
+        if component not in ("server", "desktop"):
+            raise ValueError("Unknown WebUI component")
+        self.component = component
+        self.audio = audio
+        self._configured_token = token
         self.url: str | None = None
         self.token: str | None = None
         self._runner: web.AppRunner | None = None
@@ -85,21 +104,29 @@ class WebServer:
     async def start(self) -> None:
         if self._runner is not None:
             return
-        if not self.settings.loopback and not self.settings.tls_cert:
-            raise ValueError("LAN WebUI binding requires a TLS certificate and key")
+        if (
+            not self.settings.loopback
+            and not self.settings.tls_cert
+            and not self.settings.allow_insecure_lan
+        ):
+            raise ValueError("LAN WebUI requires TLS or explicit allow_insecure_lan")
         context = None
         if self.settings.tls_cert:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.minimum_version = ssl.TLSVersion.TLSv1_2
             context.load_cert_chain(self.settings.tls_cert, self.settings.tls_key)
         self.paths.prepare()
-        self.token = secrets.token_urlsafe(32)
+        self.token = self._configured_token or secrets.token_urlsafe(32)
         try:
             package = files("hikvision_audio_bridge").joinpath("static")
-            self._assets = {
-                path: (package.joinpath(name).read_bytes(), content_type)
-                for path, (name, content_type) in _STATIC.items()
-            }
+            self._assets = {}
+            for path, (name, content_type) in _STATIC.items():
+                root = (
+                    package
+                    if name in ("style.css", "common.js")
+                    else package.joinpath(self.component)
+                )
+                self._assets[path] = root.joinpath(name).read_bytes(), content_type
             application = web.Application(
                 client_max_size=MAX_BODY_BYTES, middlewares=[self._security]
             )
@@ -108,6 +135,9 @@ class WebServer:
                 application.router.add_get(path, self._static)
             application.router.add_get("/api/status", self._status)
             application.router.add_post("/api/command", self._command)
+            if self.audio is not None:
+                application.router.add_get("/api/audio/catalog", self._audio_catalog)
+                application.router.add_get("/api/audio/stream", self.audio.websocket)
             self._runner = web.AppRunner(
                 application,
                 access_log=None,
@@ -240,7 +270,10 @@ class WebServer:
         return response
 
     def _authorized(self, request: web.Request) -> bool:
-        if self.token is None:
+        token = self.token
+        if request.path.startswith("/api/audio/"):
+            token = self.audio.access_token if self.audio is not None else None
+        if token is None:
             return False
         values = request.headers.getall("Authorization", [])
         if len(values) != 1:
@@ -249,7 +282,7 @@ class WebServer:
         if not separator or scheme.casefold() != "bearer" or not credential:
             return False
         return secrets.compare_digest(
-            credential.encode("utf-8", "replace"), self.token.encode("ascii")
+            credential.encode("utf-8", "replace"), token.encode("ascii")
         )
 
     async def _static(self, request: web.Request) -> web.Response:
@@ -260,11 +293,15 @@ class WebServer:
         message = str(error) or "The command could not be completed"
         sensitive = [self.token]
         if command is not None:
-            sensitive.extend(command.get(key) for key in ("password", "text"))
+            sensitive.extend(command.get(key) for key in ("password", "text", "token"))
         for value in sensitive:
             if isinstance(value, str) and value:
                 message = message.replace(value, "[redacted]")
         return message[:1000]
+
+    async def _audio_catalog(self, request: web.Request) -> web.Response:
+        assert self.audio is not None
+        return web.json_response({"ok": True, "status": self.audio.catalog()})
 
     async def _status(self, request: web.Request) -> web.Response:
         try:

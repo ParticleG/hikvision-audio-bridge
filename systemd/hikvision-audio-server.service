@@ -1,0 +1,28 @@
+[Unit]
+Description=Hikvision camera audio server and management WebUI
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+User=hikvision-audio
+Group=hikvision-audio
+WorkingDirectory=/opt/hikvision-audio
+ExecStart=/opt/hikvision-audio/.venv/bin/hikvision-audio-server serve
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=30
+RuntimeDirectory=hikvision-audio-server
+RuntimeDirectoryMode=0700
+StateDirectory=hikvision-audio-server
+StateDirectoryMode=0700
+UMask=0077
+Environment=PYTHONDONTWRITEBYTECODE=1
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

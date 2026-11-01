@@ -468,11 +468,12 @@ wheels = [
 
 [[package]]
 name = "hikvision-audio-bridge"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "audioop-lts" },
+    { name = "cryptography" },
     { name = "edge-tts" },
     { name = "h11" },
     { name = "httpx" },
@@ -489,6 +490,7 @@ dev = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.12,<4" },
     { name = "audioop-lts", specifier = ">=0.2.2" },
+    { name = "cryptography", specifier = ">=43" },
     { name = "edge-tts", specifier = ">=7.2,<8" },
     { name = "h11", specifier = ">=0.16,<1" },
     { name = "httpx", specifier = ">=0.28.1,<1" },

@@ -1,4 +1,4 @@
-"""Non-secret configuration and private per-user paths."""
+"""Validated non-secret configuration for independent server and desktop roles."""
 
 import ipaddress
 import json
@@ -10,7 +10,82 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
+from .audio import MAX_STREAMS
+
 APP_ID = "hikvision-audio-bridge"
+
+
+def validate_id(value: object) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,47}", value):
+        raise ValueError("IDs must use 1-48 lowercase letters, digits, '_' or '-'")
+    return value
+
+
+def _name(value: object) -> None:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > 100
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise ValueError("Names must contain 1-100 characters without controls")
+
+
+def _ids(value: tuple[str, ...]) -> None:
+    if not isinstance(value, tuple):
+        raise ValueError("Routes must be tuples of IDs")
+    for identifier in value:
+        validate_id(identifier)
+    if len(set(value)) != len(value):
+        raise ValueError("Routes must contain unique IDs")
+
+
+def _object(value: object, allowed: set[str], required: tuple[str, ...] = ()) -> dict:
+    if (
+        not isinstance(value, dict)
+        or set(value) - allowed
+        or not set(required) <= set(value)
+    ):
+        raise ValueError("Invalid settings object or unexpected fields")
+    return value
+
+
+def _list(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ValueError("Routes must be arrays of IDs")
+    result = tuple(value)
+    _ids(result)
+    return result
+
+
+def _origin(value: object) -> str:
+    if not isinstance(value, str):
+        raise ValueError("URL must be an HTTP(S) origin without credentials")
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+        or "\\" in value
+        or any(ord(character) <= 32 for character in value)
+    ):
+        raise ValueError("URL must be an HTTP(S) origin without credentials")
+    if parsed.port is not None and not 1 <= parsed.port <= 65535:
+        raise ValueError("Invalid port")
+    return urlunsplit(parsed._replace(path=""))
+
+
+def is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 @dataclass(frozen=True)
@@ -20,74 +95,92 @@ class Camera:
     channel: int = 1
 
     def __post_init__(self) -> None:
-        parsed = urlsplit(self.url)
+        object.__setattr__(self, "url", _origin(self.url))
         if (
-            parsed.scheme not in ("http", "https")
-            or not parsed.hostname
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.path not in ("", "/")
-            or parsed.query
-            or parsed.fragment
+            not isinstance(self.username, str)
+            or not self.username.strip()
+            or any(ord(character) < 32 for character in self.username)
         ):
-            raise ValueError("Camera URL must be an HTTP(S) origin without credentials")
-        if parsed.port is not None and not 1 <= parsed.port <= 65535:
-            raise ValueError("Invalid camera port")
-        if not self.username.strip() or any(ord(c) < 32 for c in self.username):
             raise ValueError("Camera username must be nonempty and contain no controls")
         if type(self.channel) is not int or not 1 <= self.channel <= 65535:
             raise ValueError("Camera channel must be an integer from 1 to 65535")
-        object.__setattr__(self, "url", urlunsplit(parsed._replace(path="")))
 
 
-def validate_id(value: object) -> str:
-    if not isinstance(value, str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,47}", value):
-        raise ValueError("IDs must use 1-48 lowercase letters, digits, '_' or '-'")
-    return value
+def camera_from_dict(value: object) -> Camera:
+    fields = {"url", "username", "channel"}
+    return Camera(**_object(value, fields, tuple(fields)))
 
 
 @dataclass(frozen=True)
 class AudioDevice:
+    """An expanded logical audio route; never a persisted server-side device."""
+
     name: str
     direction: str
     cameras: tuple[str, ...] = ()
     enabled: bool = True
 
     def __post_init__(self) -> None:
-        if (
-            not isinstance(self.name, str)
-            or not self.name.strip()
-            or len(self.name) > 100
-            or any(ord(character) < 32 for character in self.name)
-        ):
-            raise ValueError(
-                "Device names must contain 1-100 characters without controls"
-            )
+        _name(self.name)
         if self.direction not in ("speaker", "microphone"):
             raise ValueError("Device direction must be speaker or microphone")
         if type(self.enabled) is not bool:
             raise ValueError("Device switches must be booleans")
-        if not isinstance(self.cameras, tuple):
-            raise ValueError("Device cameras must be a tuple")
-        for identifier in self.cameras:
-            validate_id(identifier)
-        if len(set(self.cameras)) != len(self.cameras):
-            raise ValueError("Device camera routes must be unique")
+        _ids(self.cameras)
 
     @classmethod
     def from_dict(cls, value: object) -> "AudioDevice":
-        if (
-            not isinstance(value, dict)
-            or set(value) - {"name", "direction", "cameras", "enabled"}
-            or not {"name", "direction"} <= set(value)
-            or not isinstance(value.get("cameras", []), list)
-        ):
-            raise ValueError("Invalid audio device settings")
+        value = _object(
+            value, {"name", "direction", "cameras", "enabled"}, ("name", "direction")
+        )
         return cls(
-            name=value["name"],
-            direction=value["direction"],
-            cameras=tuple(value.get("cameras", [])),
-            enabled=value.get("enabled", True),
+            value["name"],
+            value["direction"],
+            _list(value.get("cameras", [])),
+            value.get("enabled", True),
+        )
+
+
+@dataclass(frozen=True)
+class CameraGroup:
+    name: str
+    cameras: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        _name(self.name)
+        _ids(self.cameras)
+
+    @classmethod
+    def from_dict(cls, value: object) -> "CameraGroup":
+        value = _object(value, {"name", "cameras"}, ("name", "cameras"))
+        return cls(value["name"], _list(value["cameras"]))
+
+
+@dataclass(frozen=True)
+class DesktopDevice:
+    name: str
+    direction: str
+    groups: tuple[str, ...] = ()
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        _name(self.name)
+        if self.direction not in ("speaker", "microphone"):
+            raise ValueError("Device direction must be speaker or microphone")
+        if type(self.enabled) is not bool:
+            raise ValueError("Device switches must be booleans")
+        _ids(self.groups)
+
+    @classmethod
+    def from_dict(cls, value: object) -> "DesktopDevice":
+        value = _object(
+            value, {"name", "direction", "groups", "enabled"}, ("name", "direction")
+        )
+        return cls(
+            value["name"],
+            value["direction"],
+            _list(value.get("groups", [])),
+            value.get("enabled", True),
         )
 
 
@@ -97,6 +190,7 @@ class WebSettings:
     port: int = 8765
     tls_cert: str | None = None
     tls_key: str | None = None
+    allow_insecure_lan: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.host, str):
@@ -110,6 +204,8 @@ class WebSettings:
                 ) from None
         if type(self.port) is not int or not 0 <= self.port <= 65535:
             raise ValueError("Web port must be an integer from 0 to 65535")
+        if type(self.allow_insecure_lan) is not bool:
+            raise ValueError("allow_insecure_lan must be a boolean")
         for path in (self.tls_cert, self.tls_key):
             if path is not None and (not isinstance(path, str) or not path.strip()):
                 raise ValueError(
@@ -120,95 +216,213 @@ class WebSettings:
 
     @property
     def loopback(self) -> bool:
-        return self.host == "localhost" or ipaddress.ip_address(self.host).is_loopback
+        return is_loopback(self.host)
 
     @classmethod
     def from_dict(cls, value: object) -> "WebSettings":
-        if not isinstance(value, dict) or set(value) - {
-            "host",
-            "port",
-            "tls_cert",
-            "tls_key",
-        }:
-            raise ValueError("Invalid web settings")
-        return cls(**value)
-
-
-def camera_from_dict(value: object) -> Camera:
-    if not isinstance(value, dict) or set(value) != {"url", "username", "channel"}:
-        raise ValueError("Invalid camera settings")
-    if not isinstance(value["url"], str) or not isinstance(value["username"], str):
-        raise ValueError("Camera URL and username must be strings")
-    return Camera(**value)
+        return cls(
+            **_object(
+                value, {"host", "port", "tls_cert", "tls_key", "allow_insecure_lan"}
+            )
+        )
 
 
 @dataclass(frozen=True)
-class Settings:
-    cameras: dict[str, Camera] = field(default_factory=dict)
-    devices: dict[str, AudioDevice] = field(default_factory=dict)
-    web: WebSettings = field(default_factory=WebSettings)
+class BackendSettings:
+    url: str
+    name: str = "Desktop"
+    ca_file: str | None = None
+    allow_insecure_lan: bool = False
 
     def __post_init__(self) -> None:
-        channels = set()
-        for identifier, camera in self.cameras.items():
-            validate_id(identifier)
-            origin = urlsplit(camera.url)
-            channel = (
-                origin.scheme,
-                origin.hostname,
-                origin.port or (443 if origin.scheme == "https" else 80),
-                camera.channel,
-            )
-            if channel in channels:
-                raise ValueError("A camera channel must have only one camera ID")
-            channels.add(channel)
+        object.__setattr__(self, "url", _origin(self.url))
+        _name(self.name)
+        if type(self.allow_insecure_lan) is not bool:
+            raise ValueError("allow_insecure_lan must be a boolean")
+        if self.ca_file is not None and (
+            not isinstance(self.ca_file, str) or not self.ca_file.strip()
+        ):
+            raise ValueError("CA file must be a nonempty path")
+        parsed = urlsplit(self.url)
+        if (
+            parsed.scheme == "http"
+            and not is_loopback(parsed.hostname or "")
+            and not self.allow_insecure_lan
+        ):
+            raise ValueError("LAN audio requires HTTPS or explicit allow_insecure_lan")
+
+    @classmethod
+    def from_dict(cls, value: object) -> "BackendSettings":
+        return cls(
+            **_object(value, {"url", "name", "ca_file", "allow_insecure_lan"}, ("url",))
+        )
+
+
+def _validate_cameras(cameras: dict[str, Camera]) -> None:
+    channels = set()
+    for identifier, camera in cameras.items():
+        validate_id(identifier)
+        origin = urlsplit(camera.url)
+        channel = (
+            origin.scheme,
+            origin.hostname,
+            origin.port or (443 if origin.scheme == "https" else 80),
+            camera.channel,
+        )
+        if channel in channels:
+            raise ValueError("A camera channel must have only one camera ID")
+        channels.add(channel)
+
+
+@dataclass(frozen=True)
+class RoutingSettings:
+    cameras: dict[str, Camera] = field(default_factory=dict)
+    devices: dict[str, AudioDevice] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _validate_cameras(self.cameras)
         for identifier, device in self.devices.items():
             validate_id(identifier)
             if set(device.cameras) - self.cameras.keys():
                 raise ValueError(f"Device '{identifier}' references an unknown camera")
 
+
+@dataclass(frozen=True)
+class ServerSettings:
+    cameras: dict[str, Camera] = field(default_factory=dict)
+    web: WebSettings = field(default_factory=WebSettings)
+
+    def __post_init__(self) -> None:
+        _validate_cameras(self.cameras)
+
     @classmethod
-    def from_dict(cls, value: object) -> "Settings":
-        if not isinstance(value, dict) or set(value) - {"cameras", "devices", "web"}:
-            raise ValueError("Invalid settings object")
+    def from_dict(cls, value: object) -> "ServerSettings":
+        value = _object(value, {"cameras", "web"})
         cameras = value.get("cameras", {})
-        devices = value.get("devices", {})
-        if not isinstance(cameras, dict) or not isinstance(devices, dict):
-            raise ValueError("Cameras and devices must be objects keyed by ID")
+        if not isinstance(cameras, dict):
+            raise ValueError("Cameras must be an object keyed by ID")
         return cls(
-            cameras={key: camera_from_dict(item) for key, item in cameras.items()},
-            devices={key: AudioDevice.from_dict(item) for key, item in devices.items()},
-            web=WebSettings.from_dict(value.get("web", {})),
+            {key: camera_from_dict(item) for key, item in cameras.items()},
+            WebSettings.from_dict(value.get("web", {})),
+        )
+
+
+@dataclass(frozen=True)
+class DesktopSettings:
+    backend: BackendSettings | None = None
+    groups: dict[str, CameraGroup] = field(default_factory=dict)
+    devices: dict[str, DesktopDevice] = field(default_factory=dict)
+    web: WebSettings = field(default_factory=WebSettings)
+
+    def __post_init__(self) -> None:
+        for identifier in self.groups:
+            validate_id(identifier)
+        for identifier, device in self.devices.items():
+            validate_id(identifier)
+            if set(device.groups) - self.groups.keys():
+                raise ValueError(f"Device '{identifier}' references an unknown group")
+        if len(self.devices) > MAX_STREAMS:
+            raise ValueError(
+                f"A desktop supports at most {MAX_STREAMS} virtual devices"
+            )
+
+    def routes(self) -> dict[str, AudioDevice]:
+        return {
+            identifier: AudioDevice(
+                device.name,
+                device.direction,
+                tuple(
+                    dict.fromkeys(
+                        camera
+                        for group in device.groups
+                        for camera in self.groups[group].cameras
+                    )
+                ),
+                device.enabled,
+            )
+            for identifier, device in self.devices.items()
+        }
+
+    @classmethod
+    def from_dict(cls, value: object) -> "DesktopSettings":
+        value = _object(value, {"backend", "groups", "devices", "web"})
+        groups, devices = value.get("groups", {}), value.get("devices", {})
+        if not isinstance(groups, dict) or not isinstance(devices, dict):
+            raise ValueError("Groups and devices must be objects keyed by ID")
+        backend = value.get("backend")
+        return cls(
+            BackendSettings.from_dict(backend) if backend is not None else None,
+            {key: CameraGroup.from_dict(item) for key, item in groups.items()},
+            {key: DesktopDevice.from_dict(item) for key, item in devices.items()},
+            WebSettings.from_dict(value.get("web", {})),
         )
 
     @classmethod
-    def migrate(cls, value: object) -> "Settings":
-        """Read the published single-camera format without retaining a second model."""
+    def migrate(cls, value: object) -> "DesktopSettings":
+        """Convert published local routes; old camera settings are backed up on save."""
         if not isinstance(value, dict) or not set(value) & {
             "camera",
+            "cameras",
             "speaker",
             "microphone",
         }:
             return cls.from_dict(value)
-        if set(value) - {"camera", "speaker", "microphone"}:
-            raise ValueError("Invalid legacy settings object")
-        switches = {name: value.get(name, False) for name in ("speaker", "microphone")}
-        if any(type(enabled) is not bool for enabled in switches.values()):
-            raise ValueError("Device switches must be booleans")
-        camera = value.get("camera")
-        if camera is None:
-            if any(switches.values()):
-                raise ValueError("Configure a camera before enabling audio devices")
-            return cls()
-        return cls(
-            cameras={"default": camera_from_dict(camera)},
-            devices={
-                name: AudioDevice(
-                    f"Hikvision-{name.title()}", name, ("default",), enabled
-                )
-                for name, enabled in switches.items()
-            },
+        if set(value) & {"camera", "speaker", "microphone"}:
+            value = _object(value, {"camera", "speaker", "microphone"})
+            switches = {
+                name: value.get(name, False) for name in ("speaker", "microphone")
+            }
+            if any(type(enabled) is not bool for enabled in switches.values()):
+                raise ValueError("Device switches must be booleans")
+            camera = value.get("camera")
+            if camera is None:
+                if any(switches.values()):
+                    raise ValueError("Configure a camera before enabling audio devices")
+                return cls()
+            camera_from_dict(camera)
+            value = {
+                "cameras": {"default": camera},
+                "devices": {
+                    name: {
+                        "name": f"Hikvision-{name.title()}",
+                        "direction": name,
+                        "cameras": ["default"],
+                        "enabled": enabled,
+                    }
+                    for name, enabled in switches.items()
+                },
+            }
+        value = _object(value, {"cameras", "devices", "web"})
+        cameras, devices = value.get("cameras", {}), value.get("devices", {})
+        if not isinstance(cameras, dict) or not isinstance(devices, dict):
+            raise ValueError("Cameras and devices must be objects keyed by ID")
+        routes = RoutingSettings(
+            {key: camera_from_dict(item) for key, item in cameras.items()},
+            {key: AudioDevice.from_dict(item) for key, item in devices.items()},
         )
+        return cls(
+            groups={
+                key: CameraGroup(device.name, device.cameras)
+                for key, device in routes.devices.items()
+            },
+            devices={
+                key: DesktopDevice(
+                    device.name, device.direction, (key,), device.enabled
+                )
+                for key, device in routes.devices.items()
+            },
+            web=WebSettings.from_dict(value.get("web", {})),
+        )
+
+
+def write_private(path: Path, content: bytes) -> None:
+    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}-")
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(content)
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 @dataclass(frozen=True)
@@ -239,21 +453,35 @@ class Paths:
                 )
             path.chmod(0o700)
 
-    def load(self) -> Settings:
+    def read_settings(self) -> dict:
         path = self.config / "settings.json"
-        if not path.exists():
-            return Settings()
-        return Settings.migrate(json.loads(path.read_text()))
+        return json.loads(path.read_text()) if path.exists() else {}
 
-    def save(self, settings: Settings) -> None:
-        descriptor, temporary = tempfile.mkstemp(dir=self.config, prefix=".settings-")
-        try:
+    def load_desktop(self) -> DesktopSettings:
+        return DesktopSettings.migrate(self.read_settings())
+
+    def load_server(self) -> ServerSettings:
+        return ServerSettings.from_dict(self.read_settings())
+
+    def save(self, settings: ServerSettings | DesktopSettings) -> None:
+        self.prepare()
+        previous = self.read_settings()
+        if isinstance(settings, DesktopSettings) and set(previous) & {
+            "camera",
+            "cameras",
+            "speaker",
+            "microphone",
+        }:
+            descriptor, _ = tempfile.mkstemp(
+                dir=self.config, prefix="settings-legacy-", suffix=".json"
+            )
             with os.fdopen(descriptor, "w") as output:
-                json.dump(asdict(settings), output, indent=2)
+                json.dump(previous, output, indent=2)
                 output.write("\n")
-            os.replace(temporary, self.config / "settings.json")
-        finally:
-            Path(temporary).unlink(missing_ok=True)
+        write_private(
+            self.config / "settings.json",
+            (json.dumps(asdict(settings), indent=2) + "\n").encode(),
+        )
 
 
 def _runtime_root() -> Path:

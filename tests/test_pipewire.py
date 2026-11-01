@@ -8,12 +8,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from hikvision_audio_bridge.config import AudioDevice, Paths, Settings
+from hikvision_audio_bridge.config import DesktopDevice, DesktopSettings, Paths
+from hikvision_audio_bridge.desktop import DesktopBridge
 from hikvision_audio_bridge.pipewire import (
     AudioDevices,
     device_name,
 )
-from hikvision_audio_bridge.service import Bridge
 
 
 def pcm(value):
@@ -76,7 +76,7 @@ class PipeWireTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(unloads, [("unload-module", "1"), ("unload-module", "2")])
 
     async def test_enable_uses_private_fifo_and_universal_technical_name(self):
-        device = AudioDevice('Front "Speaker"', "speaker", ("front",))
+        device = DesktopDevice('Front "Speaker"', "speaker", ("front",))
         await self.devices.enable("front", device)
         path = self.runtime / "front.pcm"
         info = path.lstat()
@@ -91,9 +91,9 @@ class PipeWireTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_route_only_edits_do_not_reload_the_pipewire_module(self):
-        device = AudioDevice("Front", "speaker", ("one",))
+        device = DesktopDevice("Front", "speaker", ("one",))
         await self.devices.enable("front", device)
-        changed = AudioDevice("Front", "speaker", ("two",))
+        changed = DesktopDevice("Front", "speaker", ("two",))
         await self.devices.enable("front", changed)
         loads = [
             call.args
@@ -110,7 +110,9 @@ class PipeWireTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_reading_a_speaker_is_bounded_and_returns_20ms_frames(self):
-        await self.devices.enable("front", AudioDevice("Front", "speaker", ("front",)))
+        await self.devices.enable(
+            "front", DesktopDevice("Front", "speaker", ("front",))
+        )
         descriptor = self.devices.devices["front"].descriptor
         first = pcm(1000)
         second = pcm(2000)
@@ -128,7 +130,7 @@ class PipeWireTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_microphone_writes_reach_the_fifo(self):
         await self.devices.enable(
-            "front", AudioDevice("Front", "microphone", ("front",))
+            "front", DesktopDevice("Front", "microphone", ("front",))
         )
         path = self.runtime / "front.pcm"
         read_descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
@@ -141,7 +143,7 @@ class PipeWireTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_flush_drains_nonzero_microphone_fifo(self):
         await self.devices.enable(
-            "front", AudioDevice("Front", "microphone", ("front",))
+            "front", DesktopDevice("Front", "microphone", ("front",))
         )
         path = self.runtime / "front.pcm"
         read_descriptor = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
@@ -156,7 +158,7 @@ class PipeWireTests(unittest.IsolatedAsyncioTestCase):
     async def test_cancelled_enable_is_settled_before_device_removal(self):
         paths = Paths(self.runtime, Path(self.temporary.name) / "config")
         paths.prepare()
-        bridge = Bridge(paths)
+        bridge = DesktopBridge(paths)
         bridge.devices = self.devices
         started = asyncio.Event()
         release = asyncio.Event()
@@ -171,11 +173,7 @@ class PipeWireTests(unittest.IsolatedAsyncioTestCase):
         self.pactl.side_effect = delayed_load
         enabling = asyncio.create_task(
             bridge.apply(
-                Settings(
-                    devices={
-                        "front": AudioDevice("Front", "speaker"),
-                    }
-                )
+                DesktopSettings(devices={"front": DesktopDevice("Front", "speaker")})
             )
         )
         removal = None
@@ -185,7 +183,7 @@ class PipeWireTests(unittest.IsolatedAsyncioTestCase):
                 enabling.cancel()
                 with self.assertRaises(asyncio.CancelledError):
                     await enabling
-                removal = asyncio.create_task(bridge.apply(Settings()))
+                removal = asyncio.create_task(bridge.apply(DesktopSettings()))
                 # Let removal reach its first suspension before the load completes.
                 asyncio.get_running_loop().call_soon(release.set)
                 await removal
@@ -202,7 +200,7 @@ class PipeWireTests(unittest.IsolatedAsyncioTestCase):
         self.pactl.side_effect = RuntimeError("pactl failed")
         with self.assertRaises(RuntimeError):
             await self.devices.enable(
-                "front", AudioDevice("Front", "speaker", ("front",))
+                "front", DesktopDevice("Front", "speaker", ("front",))
             )
         self.assertFalse((self.runtime / "front.pcm").exists())
 
@@ -211,7 +209,7 @@ class PipeWireTests(unittest.IsolatedAsyncioTestCase):
         path.write_text("not a FIFO")
         with self.assertRaises(RuntimeError):
             await self.devices.enable(
-                "front", AudioDevice("Front", "speaker", ("front",))
+                "front", DesktopDevice("Front", "speaker", ("front",))
             )
         self.assertEqual(path.read_text(), "not a FIFO")
         self.assertFalse(

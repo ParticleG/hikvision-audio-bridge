@@ -1,20 +1,14 @@
 import asyncio
-import json
-import struct
-import tempfile
 import unittest
-from dataclasses import asdict, replace
-from pathlib import Path
-from typing import cast
-from unittest.mock import AsyncMock, patch
+from dataclasses import replace
+from unittest.mock import patch
 
 import audioop
+from audio_helpers import MemoryAudio, pcm
 from camera_peer import CameraPeer
 
-from hikvision_audio_bridge.config import AudioDevice, Camera, Paths, Settings
-from hikvision_audio_bridge.credentials import Credentials
-from hikvision_audio_bridge.pipewire import SILENCE, AudioDevices
-from hikvision_audio_bridge.service import Bridge
+from hikvision_audio_bridge.config import AudioDevice, Camera, RoutingSettings
+from hikvision_audio_bridge.service import CameraEngine
 
 
 async def _pause():
@@ -27,62 +21,15 @@ async def wait_until(predicate):
             await _pause()
 
 
-def pcm(value):
-    return struct.pack("<160h", *([value] * 160))
-
-
-class TestCredentials(Credentials):
+class TestCredentials:
     def get(self, camera):
-        del camera
         return CameraPeer.password
-
-
-class MemoryDevices:
-    """Replace only PipeWire I/O; camera sockets and lifecycle remain real."""
-
-    def __init__(self):
-        self.devices = {}
-        self.frames = {}
-        self.reads = {}
-        self.microphones = {}
-        self.flushes = []
-
-    async def settle(self):
-        pass
-
-    async def enable(self, identifier, settings):
-        self.devices[identifier] = settings
-
-    async def disable(self, identifier):
-        self.devices.pop(identifier, None)
-
-    def flush(self, identifiers=None):
-        self.flushes.append(None if identifiers is None else set(identifiers))
-
-    def read_speaker(self, identifier):
-        if identifier not in self.devices:
-            raise KeyError(identifier)
-        self.reads[identifier] = self.reads.get(identifier, 0) + 1
-        return self.frames.get(identifier, SILENCE)
-
-    def write_microphone(self, identifier, pcm):
-        if identifier not in self.devices:
-            raise KeyError(identifier)
-        self.microphones.setdefault(identifier, bytearray()).extend(pcm)
-
-    async def close(self):
-        self.devices.clear()
 
 
 class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.temporary = tempfile.TemporaryDirectory()
-        directory = Path(self.temporary.name)
-        self.paths = Paths(directory / "run", directory / "config")
-        self.paths.prepare()
-        self.memory = MemoryDevices()
-        self.bridge = Bridge(self.paths, TestCredentials())
-        self.bridge.devices = cast(AudioDevices, self.memory)
+        self.memory = MemoryAudio()
+        self.bridge = CameraEngine(TestCredentials(), self.memory)
         self.first = await CameraPeer().start()
         self.second = await CameraPeer(880).start()
 
@@ -90,10 +37,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         await self.bridge.close()
         await self.first.stop()
         await self.second.stop()
-        self.temporary.cleanup()
 
     def settings(self, *, microphone=True):
-        return Settings(
+        return RoutingSettings(
             cameras={
                 "front": Camera(self.first.url, self.first.username),
             },
@@ -127,8 +73,6 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.first.opened, 1)
         self.assertEqual(self.first.closed, 0)
         self.assertEqual(self.first.speaker_connections, 1)
-        self.assertFalse(changed.devices["microphone"].enabled)
-        self.assertTrue(changed.devices["speaker"].enabled)
         self.assertFalse(self.bridge.cameras["front"].desired_microphone)
         self.assertTrue(self.bridge.cameras["front"].desired_speaker)
 
@@ -150,7 +94,6 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.first.closed, 1)
         self.assertEqual(self.second.opened, 1)
         self.assertEqual(len(self.first.received), old_count)
-        self.assertEqual(self.paths.load(), changed)
 
     async def test_removing_all_routes_closes_the_owned_session(self):
         settings = self.settings()
@@ -277,7 +220,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(reconnect, return_exceptions=True)
 
     async def test_concurrent_camera_cleanup_survives_caller_cancellation(self):
-        settings = Settings(
+        settings = RoutingSettings(
             cameras={
                 "front": Camera(self.first.url, self.first.username),
                 "back": Camera(self.second.url, self.second.username),
@@ -327,7 +270,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(restart, return_exceptions=True)
 
     async def test_overlapping_routes_share_one_session_per_camera(self):
-        settings = Settings(
+        settings = RoutingSettings(
             cameras={
                 "front": Camera(self.first.url, self.first.username),
                 "back": Camera(self.second.url, self.second.username),
@@ -361,18 +304,9 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.second.microphone_connections, 1)
         self.assertEqual(len(self.bridge.cameras["front"].streams), 2)
         self.assertEqual(len(self.bridge.cameras["back"].streams), 2)
-        status = self.bridge.status()
-        self.assertEqual(
-            set(status["devices"]),
-            {"broadcast", "front_speaker", "listen", "back_mic"},
-        )
-        self.assertEqual(
-            status["devices"]["broadcast"]["name"],
-            "hikvision_audio_broadcast",
-        )
 
     async def test_unrelated_toggle_does_not_retry_or_restart_cameras(self):
-        settings = Settings(
+        settings = RoutingSettings(
             cameras={
                 "front": Camera(self.first.url, self.first.username),
                 "back": Camera(self.second.url, self.second.username),
@@ -420,7 +354,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.bridge.cameras["front"].cleanup_error)
 
     async def test_direction_switch_changes_streams_without_reopening(self):
-        settings = Settings(
+        settings = RoutingSettings(
             cameras={
                 "front": Camera(self.first.url, self.first.username),
             },
@@ -462,7 +396,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bridge.status()["cameras"]["front"]["connection"], "idle")
 
     async def test_cleanup_failure_is_reported_separately_from_stream_error(self):
-        settings = Settings(
+        settings = RoutingSettings(
             cameras={
                 "front": Camera(self.first.url, self.first.username),
             },
@@ -491,168 +425,6 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(status["connection"], "error")
         self.assertEqual(self.first.closed, 1)
 
-    async def test_status_exposes_per_camera_and_tts_contract(self):
-        settings = self.settings()
-        await self.bridge.apply(settings)
-        async with asyncio.timeout(3):
-            await self.first.received_audio.wait()
-            await self.first.microphone_started.wait()
-            await wait_until(
-                lambda: (
-                    self.bridge.cameras["front"].session is not None
-                    and self.bridge.cameras["front"].session.sent_bytes > 0
-                    and self.bridge.cameras["front"].session.received_bytes > 0
-                    and self.bridge.cameras["front"].connection == "connected"
-                )
-            )
-        status = self.bridge.status()
-        self.assertEqual(set(status), {"settings", "cameras", "devices", "tts"})
-        self.assertEqual(status["settings"], asdict(settings))
-        self.assertEqual(
-            status["devices"],
-            {
-                "speaker": {"name": "hikvision_audio_speaker"},
-                "microphone": {"name": "hikvision_audio_microphone"},
-            },
-        )
-        camera = status["cameras"]["front"]
-        self.assertEqual(camera["connection"], "connected")
-        self.assertEqual(camera["codec"], "G.711alaw")
-        self.assertIsNone(camera["error"])
-        self.assertIsNone(camera["cleanup_error"])
-        self.assertGreater(camera["sent_bytes"], 0)
-        self.assertGreater(camera["received_bytes"], 0)
-        self.assertEqual(
-            status["tts"],
-            {"state": "idle", "error": None, "devices": []},
-        )
-
-    async def test_speech_is_routed_once_per_target_and_plays_to_completion(self):
-        settings = Settings(
-            cameras={
-                "front": Camera(self.first.url, self.first.username),
-                "back": Camera(self.second.url, self.second.username),
-            },
-            devices={
-                "one": AudioDevice("One", "speaker", ("front", "back")),
-                "two": AudioDevice("Two", "speaker", ("front",)),
-            },
-        )
-        await self.bridge.apply(settings)
-        async with asyncio.timeout(3):
-            await asyncio.gather(
-                self.first.received_audio.wait(),
-                self.second.received_audio.wait(),
-            )
-            await wait_until(
-                lambda: (
-                    self.bridge.cameras["front"].connection == "connected"
-                    and self.bridge.cameras["back"].connection == "connected"
-                )
-            )
-        frame = pcm(8000)
-        synth = AsyncMock(return_value=frame * 2)
-        with patch("hikvision_audio_bridge.service.synthesize", new=synth):
-            await self.bridge.speak("hello", ["one", "two"])
-            self.assertEqual(self.bridge.speech_cameras, ("front", "back"))
-            self.assertEqual(self.bridge.tts_devices, ["one", "two"])
-            await wait_until(lambda: self.bridge.speech_playback is not None)
-            playback = self.bridge.speech_playback
-            self.assertIsNotNone(playback)
-            assert playback is not None
-            await playback.finished.wait()
-            await wait_until(lambda: self.bridge.tts_state == "idle")
-        synth.assert_awaited_once()
-        self.assertEqual(playback.targets, ("front", "back"))
-        self.assertEqual(self.first.speaker_connections, 1)
-        self.assertEqual(self.second.speaker_connections, 1)
-        encoded = audioop.lin2alaw(frame, 2)
-        self.assertEqual(bytes(self.first.received).count(encoded), 2)
-        self.assertEqual(bytes(self.second.received).count(encoded), 2)
-        status = self.bridge.status()["tts"]
-        self.assertEqual(status, {"state": "idle", "error": None, "devices": []})
-
-    async def test_speak_validates_targets_without_calling_the_provider(self):
-        settings = Settings(
-            cameras={
-                "front": Camera(self.first.url, self.first.username),
-            },
-            devices={
-                "speaker": AudioDevice("Speaker", "speaker", ("front",), False),
-                "microphone": AudioDevice("Microphone", "microphone", ("front",)),
-            },
-        )
-        await self.bridge.apply(settings)
-        async with asyncio.timeout(3):
-            await self.first.microphone_started.wait()
-        synth = AsyncMock(return_value=pcm(1000))
-        with patch("hikvision_audio_bridge.service.synthesize", new=synth):
-            for devices in ([], ["missing"], ["speaker"], ["microphone"]):
-                with self.subTest(devices=devices):
-                    with self.assertRaises(ValueError):
-                        await self.bridge.speak("hello", devices)
-        synth.assert_not_awaited()
-        self.assertEqual(self.bridge.tts_state, "idle")
-
-    async def test_stop_speech_cancels_synthesis_and_rejects_overlap(self):
-        await self.bridge.apply(self.settings())
-        async with asyncio.timeout(3):
-            await self.first.received_audio.wait()
-        started = asyncio.Event()
-        cancelled = asyncio.Event()
-
-        async def blocking_synth(_text, _voice):
-            started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
-
-        with patch("hikvision_audio_bridge.service.synthesize", new=blocking_synth):
-            status = await self.bridge.speak("hello", ["speaker"])
-            self.assertEqual(status["tts"]["state"], "synthesizing")
-            await started.wait()
-            with self.assertRaises(ValueError):
-                await self.bridge.speak("again", ["speaker"])
-            status = await self.bridge.stop_speech()
-            self.assertEqual(status["tts"]["state"], "idle")
-            self.assertEqual(status["tts"]["devices"], [])
-            await cancelled.wait()
-        self.assertIsNone(self.bridge.speech_task)
-        self.assertIsNone(self.bridge.speech_playback)
-
-    async def test_stop_speech_waits_for_provider_cleanup(self):
-        await self.bridge.apply(self.settings())
-        async with asyncio.timeout(3):
-            await self.first.received_audio.wait()
-        started = asyncio.Event()
-        cleaning = asyncio.Event()
-        release = asyncio.Event()
-
-        async def delayed_cleanup(_text, _voice):
-            started.set()
-            try:
-                await asyncio.Event().wait()
-            finally:
-                cleaning.set()
-                await release.wait()
-
-        with patch("hikvision_audio_bridge.service.synthesize", new=delayed_cleanup):
-            await self.bridge.speak("hello", ["speaker"])
-            await started.wait()
-            stop = asyncio.create_task(self.bridge.stop_speech())
-            try:
-                async with asyncio.timeout(3):
-                    await cleaning.wait()
-                    self.assertFalse(stop.done())
-                    release.set()
-                    await stop
-            finally:
-                release.set()
-                await asyncio.gather(stop, return_exceptions=True)
-        self.assertIsNone(self.bridge.speech_task)
-
     async def test_failed_reconnect_preserves_previous_cleanup_error(self):
         settings = self.settings()
         await self.bridge.apply(settings)
@@ -669,97 +441,24 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(status["error"])
         self.assertEqual(status["cleanup_error"], cleanup_error)
 
-    async def test_close_cancels_inflight_synthesis_and_owned_sessions(self):
-        await self.bridge.apply(self.settings())
-        async with asyncio.timeout(3):
-            await self.first.received_audio.wait()
-        started = asyncio.Event()
-        cancelled = asyncio.Event()
-
-        async def blocking_synth(_text, _voice):
-            started.set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
-
-        with patch("hikvision_audio_bridge.service.synthesize", new=blocking_synth):
-            await self.bridge.speak("hello", ["speaker"])
-            await started.wait()
-            await self.bridge.close()
-            await cancelled.wait()
-        self.assertIsNone(self.bridge.speech_task)
-        self.assertFalse(self.bridge.cameras)
-        self.assertFalse(self.memory.devices)
-        self.assertEqual(self.first.closed, 1)
-
-    async def test_speech_errors_do_not_expose_spoken_text(self):
-        await self.bridge.apply(self.settings())
-        async with asyncio.timeout(3):
-            await self.first.received_audio.wait()
-        text = "private spoken announcement"
-
-        async def failing_synth(phrase, _voice):
-            raise RuntimeError(phrase)
-
-        with patch("hikvision_audio_bridge.service.synthesize", new=failing_synth):
-            await self.bridge.speak(text, ["speaker"])
-            await wait_until(
-                lambda: (
-                    self.bridge.tts_state == "error" and self.bridge.speech_task is None
-                )
+    async def test_standalone_speech_deduplicates_targets_and_closes_owned_sessions(
+        self,
+    ):
+        await self.bridge.apply(
+            RoutingSettings(
+                cameras={
+                    "front": Camera(self.first.url, self.first.username),
+                    "back": Camera(self.second.url, self.second.username),
+                }
             )
-        status = self.bridge.status()
-        self.assertEqual(status["tts"]["devices"], ["speaker"])
-        self.assertNotIn(text, json.dumps(status))
-        self.assertNotIn(text, (self.paths.config / "settings.json").read_text())
-
-    async def test_route_change_cancels_speech_before_it_can_leak(self):
-        settings = Settings(
-            cameras={
-                "front": Camera(self.first.url, self.first.username),
-                "back": Camera(self.second.url, self.second.username),
-            },
-            devices={
-                "one": AudioDevice("One", "speaker", ("front",)),
-                "back_speaker": AudioDevice("Back", "speaker", ("back",)),
-                "listen": AudioDevice("Listen", "microphone", ("front", "back")),
-            },
         )
-        await self.bridge.apply(settings)
-        async with asyncio.timeout(3):
-            await asyncio.gather(
-                self.first.received_audio.wait(),
-                self.second.received_audio.wait(),
-                self.first.microphone_started.wait(),
-                self.second.microphone_started.wait(),
-            )
-            await wait_until(
-                lambda: (
-                    self.bridge.cameras["front"].connection == "connected"
-                    and self.bridge.cameras["back"].connection == "connected"
-                )
-            )
         frame = pcm(8000)
-        synth = AsyncMock(return_value=frame * 64)
-        with patch("hikvision_audio_bridge.service.synthesize", new=synth):
-            await self.bridge.speak("announcement", ["one"])
-            await wait_until(lambda: self.bridge.tts_state == "playing")
-            before = len(self.second.received)
-            changed = replace(
-                settings,
-                devices={
-                    **settings.devices,
-                    "one": replace(settings.devices["one"], cameras=("back",)),
-                },
-            )
-            await self.bridge.apply(changed)
-            self.assertEqual(self.bridge.tts_state, "idle")
-            self.assertIsNone(self.bridge.speech_playback)
-            await wait_until(lambda: len(self.second.received) >= before + 160 * 3)
+        await self.bridge.play_pcm(frame * 2, ("front", "front", "back"))
         encoded = audioop.lin2alaw(frame, 2)
-        self.assertNotIn(encoded, bytes(self.second.received[before:]))
+        self.assertEqual(bytes(self.first.received).count(encoded), 2)
+        self.assertEqual(bytes(self.second.received).count(encoded), 2)
+        self.assertEqual((self.first.opened, self.first.closed), (1, 1))
+        self.assertEqual((self.second.opened, self.second.closed), (1, 1))
 
 
 if __name__ == "__main__":

@@ -1,15 +1,13 @@
-"""Live configuration, independent camera sessions and audio routing."""
+"""One owned camera session per channel, shared by logical network audio routes."""
 
 import asyncio
 import contextlib
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 
 from .camera import CameraSession
-from .config import Camera, Paths, Settings, validate_id
-from .credentials import Credentials
-from .pipewire import AudioDevices, device_name
-from .router import AudioRouter, SpeechPlayback, camera_routes
-from .tts import DEFAULT_VOICE, TTSError, synthesize
+from .config import Camera, RoutingSettings, validate_id
+from .router import AudioIO, AudioRouter, SpeechPlayback, camera_routes
+from .vault import CameraCredentials
 
 
 async def _settle(task: asyncio.Task) -> None:
@@ -32,6 +30,7 @@ class _CameraState:
     stream_stops: dict[str, asyncio.Task] = field(default_factory=dict)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     changed: asyncio.Event = field(default_factory=asyncio.Event)
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
     connection: str = "idle"
     error: str | None = None
     cleanup_error: str | None = None
@@ -41,142 +40,116 @@ class _CameraState:
     closing: bool = False
 
 
-class Bridge:
-    def __init__(self, paths: Paths, credentials: Credentials | None = None):
-        self.paths = paths
-        self.credentials = credentials or Credentials()
-        self.devices = AudioDevices(paths.runtime)
+class CameraEngine:
+    def __init__(self, credentials: CameraCredentials, devices: AudioIO):
+        self.credentials = credentials
+        self.devices = devices
         self.router = AudioRouter(lambda: self.devices)
-        self.settings = Settings()
+        self.settings = RoutingSettings()
         self.lock = asyncio.Lock()
         self.cameras: dict[str, _CameraState] = {}
-        self.tts_state = "idle"
-        self.tts_error: str | None = None
-        self.tts_devices: list[str] = []
-        self.speech_task: asyncio.Task | None = None
-        self.speech_generation = 0
-        self.speech_playback: SpeechPlayback | None = None
-        self.speech_devices: tuple[str, ...] = ()
         self.speech_cameras: tuple[str, ...] = ()
+        self.speech_playback: SpeechPlayback | None = None
+        self.speech_cleanup: asyncio.Task | None = None
         self.close_task: asyncio.Task | None = None
+        self.closing = False
 
     def status(self) -> dict:
         cameras = {}
-        for identifier in self.settings.cameras:
-            state = self.cameras.get(identifier)
-            if state is None:
-                cameras[identifier] = {
-                    "connection": "idle",
-                    "error": None,
-                    "cleanup_error": None,
-                    "codec": None,
-                    "sent_bytes": 0,
-                    "received_bytes": 0,
-                }
-                continue
+        for identifier, camera in self.settings.cameras.items():
+            state = self.cameras.get(identifier) or _CameraState(identifier, camera)
             session = state.session
-            codec = (session.codec or None) if session is not None else state.codec
             cameras[identifier] = {
                 "connection": state.connection,
                 "error": state.error,
                 "cleanup_error": state.cleanup_error,
-                "codec": codec,
-                "sent_bytes": (
-                    session.sent_bytes if session is not None else state.sent_bytes
-                ),
-                "received_bytes": (
-                    session.received_bytes
-                    if session is not None
-                    else state.received_bytes
-                ),
+                "codec": (session.codec or None) if session else state.codec,
+                "sent_bytes": session.sent_bytes if session else state.sent_bytes,
+                "received_bytes": session.received_bytes
+                if session
+                else state.received_bytes,
             }
-        return {
-            "settings": asdict(self.settings),
-            "cameras": cameras,
-            "devices": {
-                identifier: {"name": device_name(identifier)}
-                for identifier in self.settings.devices
-            },
-            "tts": {
-                "state": self.tts_state,
-                "error": self.tts_error,
-                "devices": list(self.tts_devices),
-            },
-        }
+        return {"cameras": cameras}
 
     async def apply(
         self,
-        settings: Settings,
+        settings: RoutingSettings,
         *,
-        persist: bool = True,
         restart: bool = False,
         camera_id: str | None = None,
     ) -> dict:
-        if not isinstance(settings, Settings):
-            raise TypeError("settings must be a Settings instance")
+        if not isinstance(settings, RoutingSettings):
+            raise TypeError("settings must be a RoutingSettings instance")
         if camera_id is not None:
             validate_id(camera_id)
         async with self.lock:
+            if self.closing:
+                raise RuntimeError("Camera server is stopping")
             previous = self.settings
-            restart_ids = self._restart_ids(previous, settings, restart, camera_id)
-            if persist:
-                self.paths.save(settings)
-            if self._speech_affected(previous, settings, restart_ids):
-                self._cancel_speech()
+            restart_ids: set[str] = set()
+            if restart:
+                restart_ids = set(settings.cameras) | set(previous.cameras)
+                if camera_id is not None:
+                    if camera_id not in restart_ids:
+                        raise ValueError("Unknown camera ID")
+                    restart_ids = {camera_id}
+            if self.speech_playback is not None and any(
+                identifier in restart_ids
+                or previous.cameras.get(identifier) != settings.cameras.get(identifier)
+                for identifier in self.speech_cameras
+            ):
+                self.speech_playback.fail("Speech target changed or was reconnected")
+                self.speech_cameras = ()
+                self.router.clear_speech()
             self.settings = settings
-            self.router.configure(settings)
+            await self._reconcile(restart_ids)
+            return self.status()
 
-            for identifier in settings.cameras:
-                if identifier not in self.cameras:
-                    self.cameras[identifier] = _CameraState(
-                        identifier, settings.cameras[identifier]
-                    )
-
-            pending = []
-            for state in self.cameras.values():
-                if state.stop_task is not None or (
-                    state.worker is not None and state.worker.done()
-                ):
-                    pending.append(self._ensure_stop(state))
-            if pending:
-                await asyncio.gather(*(asyncio.shield(task) for task in pending))
-
-            speaker, microphone = camera_routes(settings)
-            stop_ids: set[str] = set()
-            reset_ids: set[str] = set()
-            for identifier, state in self.cameras.items():
-                if identifier not in settings.cameras:
+    async def _reconcile(self, restart_ids: set[str]) -> None:
+        """Run while holding lock; speech changes reuse the current route snapshot."""
+        settings = self.settings
+        self.router.configure(settings)
+        for identifier, camera in settings.cameras.items():
+            self.cameras.setdefault(identifier, _CameraState(identifier, camera))
+        pending = [
+            self._ensure_stop(state)
+            for state in self.cameras.values()
+            if state.stop_task is not None
+            or (state.worker is not None and state.worker.done())
+        ]
+        if pending:
+            await asyncio.gather(*(asyncio.shield(task) for task in pending))
+        speaker, microphone = camera_routes(settings)
+        stop_ids: set[str] = set()
+        reset_ids: set[str] = set()
+        for identifier, state in self.cameras.items():
+            if identifier not in settings.cameras:
+                stop_ids.add(identifier)
+                continue
+            if state.worker is None and state.connection in ("connecting", "connected"):
+                state.connection = "idle"
+            if (
+                identifier in restart_ids
+                or state.camera != settings.cameras[identifier]
+            ):
+                stop_ids.add(identifier)
+                reset_ids.add(identifier)
+            elif not (
+                speaker.get(identifier)
+                or microphone.get(identifier)
+                or identifier in self.speech_cameras
+            ):
+                if state.worker is not None:
                     stop_ids.add(identifier)
-                    continue
-                if state.worker is None and state.connection in (
-                    "connecting",
-                    "connected",
-                ):
-                    state.connection = "idle"
-                if (
-                    identifier in restart_ids
-                    or state.camera != settings.cameras[identifier]
-                ):
-                    stop_ids.add(identifier)
-                    reset_ids.add(identifier)
-                elif not (speaker.get(identifier) or microphone.get(identifier)):
-                    if state.worker is not None:
-                        stop_ids.add(identifier)
-
-            stops = [
-                self._ensure_stop(self.cameras[identifier])
-                for identifier in sorted(stop_ids)
-            ]
-            if stops:
-                await asyncio.gather(*(asyncio.shield(task) for task in stops))
-
-            for identifier in list(self.cameras):
-                if identifier not in settings.cameras:
-                    del self.cameras[identifier]
-            for identifier in reset_ids:
-                state = self.cameras.get(identifier)
-                if state is None:
-                    continue
+        stops = [self._ensure_stop(self.cameras[identifier]) for identifier in stop_ids]
+        if stops:
+            await asyncio.gather(*(asyncio.shield(task) for task in stops))
+        for identifier in list(self.cameras):
+            if identifier not in settings.cameras:
+                del self.cameras[identifier]
+        for identifier in reset_ids:
+            state = self.cameras.get(identifier)
+            if state is not None:
                 state.camera = settings.cameras[identifier]
                 state.error = None
                 state.codec = None
@@ -184,105 +157,37 @@ class Bridge:
                 state.received_bytes = 0
                 state.connection = "idle"
                 state.closing = False
-
-            # A cleanup task may have reset router outputs after the first
-            # configuration; recreate any missing path before streams restart.
-            self.router.configure(settings)
-
-            for identifier, state in self.cameras.items():
-                state.desired_speaker = bool(speaker.get(identifier))
-                state.desired_microphone = bool(microphone.get(identifier))
-                state.speaker_devices = speaker.get(identifier, ())
-                state.microphone_devices = microphone.get(identifier, ())
-
-            syncs = [
-                self._sync_streams(state)
-                for identifier, state in self.cameras.items()
-                if identifier in settings.cameras
-                and state.worker is not None
-                and identifier not in stop_ids
-                and not state.closing
-            ]
-            if syncs:
-                await asyncio.gather(*syncs)
-
-            await self._reconcile_devices(settings)
-
-            if any(device.enabled for device in settings.devices.values()):
-                self.router.start()
-            else:
-                await self.router.close()
-
-            starts = []
-            for identifier, state in self.cameras.items():
-                if identifier not in settings.cameras:
-                    continue
-                if not (state.desired_speaker or state.desired_microphone):
-                    continue
-                if identifier in reset_ids:
-                    starts.append(identifier)
-                elif state.worker is None and state.connection == "idle":
-                    starts.append(identifier)
-            for identifier in starts:
-                self._start_camera(
-                    self.cameras[identifier], settings.cameras[identifier]
-                )
-            return self.status()
-
-    def _restart_ids(
-        self,
-        previous: Settings,
-        settings: Settings,
-        restart: bool,
-        camera_id: str | None,
-    ) -> set[str]:
-        if not restart:
-            return set()
-        if camera_id is not None:
-            if camera_id not in settings.cameras and camera_id not in previous.cameras:
-                raise ValueError("Unknown camera ID")
-            return {camera_id}
-        return set(settings.cameras) | set(previous.cameras)
-
-    def _speech_affected(
-        self, previous: Settings, settings: Settings, restart_ids: set[str]
-    ) -> bool:
+        self.router.configure(settings)
+        for identifier, state in self.cameras.items():
+            state.desired_speaker = (
+                bool(speaker.get(identifier)) or identifier in self.speech_cameras
+            )
+            state.desired_microphone = bool(microphone.get(identifier))
+            state.speaker_devices = speaker.get(identifier, ())
+            state.microphone_devices = microphone.get(identifier, ())
+        syncs = [
+            self._sync_streams(state)
+            for identifier, state in self.cameras.items()
+            if state.worker is not None
+            and identifier not in stop_ids
+            and not state.closing
+        ]
+        if syncs:
+            await asyncio.gather(*syncs)
         if (
-            self.speech_task is None
-            or self.speech_task.done()
-            or not self.speech_cameras
+            any(device.enabled for device in settings.devices.values())
+            or self.speech_cameras
         ):
-            return False
-        for identifier in self.speech_devices:
-            before = previous.devices.get(identifier)
-            after = settings.devices.get(identifier)
-            if before is None or after is None:
-                return True
-            if not after.enabled or after.direction != "speaker":
-                return True
-            if before.cameras != after.cameras:
-                return True
-        old_speaker, _ = camera_routes(previous)
-        new_speaker, _ = camera_routes(settings)
-        for identifier in self.speech_cameras:
-            if previous.cameras.get(identifier) != settings.cameras.get(identifier):
-                return True
-            if old_speaker.get(identifier) != new_speaker.get(identifier):
-                return True
-        return bool(set(self.speech_cameras) & restart_ids)
-
-    async def _reconcile_devices(self, settings: Settings) -> None:
-        await self.devices.settle()
-        operations = []
-        for identifier, device in settings.devices.items():
-            if device.enabled:
-                operations.append(self.devices.enable(identifier, device))
-        for identifier in list(self.devices.devices):
-            device = settings.devices.get(identifier)
-            if device is None or not device.enabled:
-                operations.append(self.devices.disable(identifier))
-        if operations:
-            await asyncio.gather(*operations)
+            self.router.start()
+        else:
+            await self.router.close()
+        for identifier, state in self.cameras.items():
+            if not (state.desired_speaker or state.desired_microphone):
+                continue
+            if identifier in reset_ids or (
+                state.worker is None and state.connection == "idle"
+            ):
+                self._start_camera(state, settings.cameras[identifier])
 
     async def _sync_streams(self, state: _CameraState) -> None:
         async with state.lock:
@@ -352,6 +257,7 @@ class Bridge:
         state.stream_stops.clear()
         state.closing = False
         state.changed.clear()
+        state.ready.clear()
         state.worker = asyncio.create_task(self._run_camera(state))
 
     def _ensure_stop(self, state: _CameraState) -> asyncio.Task:
@@ -387,6 +293,7 @@ class Bridge:
             state.stream_stops.clear()
             if state.connection in ("connecting", "connected"):
                 state.connection = "idle"
+            state.ready.set()
             if state.stop_task is asyncio.current_task():
                 state.stop_task = None
 
@@ -401,20 +308,20 @@ class Bridge:
             await session.open()
             while True:
                 async with state.lock:
-                    if state.closing:
-                        return
-                    if not (state.desired_speaker or state.desired_microphone):
+                    if state.closing or not (
+                        state.desired_speaker or state.desired_microphone
+                    ):
                         return
                     if state.session is not session:
                         return
                     await self._sync_streams_locked(state)
                     state.connection = "connected"
+                    state.ready.set()
                     state.changed.clear()
                     waiter = asyncio.create_task(state.changed.wait())
                     watched = dict(state.streams)
                 completed, _ = await asyncio.wait(
-                    [waiter, *watched.values()],
-                    return_when=asyncio.FIRST_COMPLETED,
+                    [waiter, *watched.values()], return_when=asyncio.FIRST_COMPLETED
                 )
                 waiter.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -443,6 +350,7 @@ class Bridge:
             state.connection = "error"
         finally:
             state.closing = True
+            state.ready.set()
             state.cleanup_task = asyncio.create_task(
                 self._finish_camera(state, session, waiter)
             )
@@ -479,14 +387,6 @@ class Bridge:
         except Exception as error:
             local_error = str(error) or type(error).__name__
             state.cleanup_error = local_error
-        if (
-            self.speech_task is not None
-            and not self.speech_task.done()
-            and state.camera_id in self.speech_cameras
-        ):
-            self._cancel_speech(
-                f"Speech stopped: camera '{state.camera_id}' is unavailable"
-            )
         if session is not None:
             owned = session.opened
             try:
@@ -503,192 +403,71 @@ class Bridge:
             state.connection = "error" if state.error or state.cleanup_error else "idle"
         state.closing = False
         state.changed.set()
+        state.ready.set()
 
-    async def speak(
-        self,
-        text: str,
-        device_ids: list[str],
-        voice: str = DEFAULT_VOICE,
-    ) -> dict:
+    async def play_pcm(self, pcm: bytes, targets: tuple[str, ...]) -> None:
+        playback = SpeechPlayback(pcm, targets)
         async with self.lock:
-            if self.speech_task is not None and not self.speech_task.done():
-                raise ValueError("Speech synthesis is already in progress")
-            if not isinstance(device_ids, (list, tuple)) or not device_ids:
-                raise ValueError("Select at least one speaker device")
-            selected: list[str] = []
-            for identifier in device_ids:
-                if not isinstance(identifier, str):
-                    raise ValueError("Device IDs must be strings")
-                if identifier not in selected:
-                    selected.append(identifier)
-            targets: list[str] = []
-            for identifier in selected:
-                device = self.settings.devices.get(identifier)
-                if device is None:
-                    raise ValueError(f"Unknown audio device: {identifier}")
-                if not device.enabled:
-                    raise ValueError(f"Audio device is disabled: {identifier}")
-                if device.direction != "speaker":
-                    raise ValueError(f"Audio device is not a speaker: {identifier}")
-                if not device.cameras:
-                    raise ValueError(
-                        f"Speaker has no connected camera routes: {identifier}"
-                    )
-                for camera_id in device.cameras:
-                    state = self.cameras.get(camera_id)
-                    if (
-                        state is None
-                        or state.connection != "connected"
-                        or not state.desired_speaker
-                        or state.session is None
-                        or not state.session.opened
-                        or "speaker" not in state.streams
-                        or state.streams["speaker"].done()
-                    ):
-                        raise ValueError(f"Camera route is not connected: {camera_id}")
-                    if camera_id not in targets:
-                        targets.append(camera_id)
-            self.speech_generation += 1
-            token = self.speech_generation
-            self.speech_task = asyncio.create_task(
-                self._speak(token, text, voice, tuple(targets))
-            )
-            self.speech_devices = tuple(selected)
-            self.speech_cameras = tuple(targets)
-            self.speech_playback = None
-            self.router.clear_speech()
-            self.tts_state = "synthesizing"
-            self.tts_error = None
-            self.tts_devices = selected
-            return self.status()
-
-    async def _speak(
-        self,
-        token: int,
-        text: str,
-        voice: str,
-        targets: tuple[str, ...],
-    ) -> None:
-        playback = None
+            if self.closing or self.speech_playback is not None:
+                raise RuntimeError("The speech player is unavailable")
+            if (
+                not pcm
+                or len(pcm) % 2
+                or not targets
+                or set(targets) - self.settings.cameras.keys()
+            ):
+                raise ValueError("Speech requires PCM16 audio and known target cameras")
+            self.speech_playback = playback
+            self.speech_cameras = playback.targets
         try:
-            try:
-                pcm = await synthesize(text, voice)
-            except asyncio.CancelledError:
-                raise
-            except (TTSError, TypeError, ValueError) as error:
-                await self._speech_error(token, str(error) or type(error).__name__)
-                return
-            except Exception:
-                await self._speech_error(token, "Speech synthesis failed")
-                return
-            if not pcm:
-                await self._speech_error(token, "Speech synthesis returned no audio")
-                return
             async with self.lock:
-                if not self._speech_current(token):
-                    return
-                for camera_id in targets:
-                    state = self.cameras.get(camera_id)
-                    if (
-                        state is None
-                        or state.connection != "connected"
-                        or not state.desired_speaker
-                        or state.session is None
-                        or not state.session.opened
-                        or "speaker" not in state.streams
-                        or state.streams["speaker"].done()
-                    ):
-                        self.tts_state = "error"
-                        self.tts_error = (
-                            f"Speech target is no longer connected: {camera_id}"
+                await self._reconcile(set())
+                states = [self.cameras[target] for target in playback.targets]
+            async with asyncio.timeout(10):
+                await asyncio.gather(*(state.ready.wait() for state in states))
+            async with self.lock:
+                if (
+                    self.speech_playback is not playback
+                    or self.speech_cameras != playback.targets
+                ):
+                    raise RuntimeError("Speech targets changed")
+                for state in states:
+                    if state.connection != "connected" or state.closing:
+                        raise RuntimeError(
+                            f"Camera route is not connected: {state.camera_id}"
                         )
-                        self.speech_generation += 1
-                        self.speech_cameras = ()
-                        self.router.clear_speech()
-                        self.speech_playback = None
-                        return
-                playback = SpeechPlayback(pcm, targets)
-                self.speech_playback = playback
                 self.router.begin_speech(playback)
-                self.tts_state = "playing"
-            await playback.finished.wait()
-            async with self.lock:
-                if not self._speech_current(token):
-                    return
-                if self.speech_playback is not playback:
-                    return
-                self.router.clear_speech()
+            async with asyncio.timeout(len(pcm) / 16000 + 15):
+                await playback.finished.wait()
+            if playback.error:
+                raise RuntimeError(playback.error)
+        finally:
+            self.speech_cleanup = asyncio.create_task(self._finish_speech(playback))
+            await asyncio.shield(self.speech_cleanup)
+
+    async def _finish_speech(self, playback: SpeechPlayback) -> None:
+        async with self.lock:
+            if self.speech_playback is playback:
                 self.speech_playback = None
                 self.speech_cameras = ()
-                self.tts_state = "idle"
-                self.tts_error = None
-                self.tts_devices = []
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            await self._speech_error(token, "Speech playback failed")
-        finally:
-            if self.speech_task is asyncio.current_task():
-                self.speech_task = None
-
-    def _speech_current(self, token: int) -> bool:
-        return (
-            token == self.speech_generation
-            and self.speech_task is asyncio.current_task()
-        )
-
-    async def _speech_error(self, token: int, message: str) -> None:
-        async with self.lock:
-            if not self._speech_current(token):
-                return
-            self.speech_generation += 1
-            self.speech_cameras = ()
-            self.router.clear_speech()
-            self.speech_playback = None
-            self.tts_state = "error"
-            self.tts_error = message
-
-    def _cancel_speech(self, error: str | None = None) -> None:
-        task = self.speech_task
-        self.speech_generation += 1
-        self.speech_playback = None
-        self.speech_devices = ()
-        self.speech_cameras = ()
-        self.router.clear_speech()
-        self.tts_state = "error" if error else "idle"
-        self.tts_error = error
-        if error is None:
-            self.tts_devices = []
-        if task is not None and not task.done() and not task.cancelling():
-            task.cancel()
-
-    async def stop_speech(self) -> dict:
-        async with self.lock:
-            task = self.speech_task
-            self._cancel_speech()
-            if task is not None:
-                await asyncio.shield(_settle(task))
-            return self.status()
+                self.router.clear_speech()
+                if not self.closing:
+                    await self._reconcile(set())
 
     async def close(self) -> None:
-        task = self.close_task
-        if task is None:
-            task = asyncio.create_task(self._close())
-            self.close_task = task
-        await asyncio.shield(task)
+        if self.close_task is None:
+            self.close_task = asyncio.create_task(self._close())
+        await asyncio.shield(self.close_task)
 
     async def _close(self) -> None:
+        self.closing = True
+        if self.speech_playback is not None:
+            self.speech_playback.fail("Camera server is stopping")
+        if self.speech_cleanup is not None:
+            await asyncio.shield(self.speech_cleanup)
         async with self.lock:
-            speech = self.speech_task
-            self._cancel_speech()
-            if speech is not None:
-                await asyncio.gather(speech, return_exceptions=True)
-            states = list(self.cameras.values())
-            stops = [self._ensure_stop(state) for state in states]
+            stops = [self._ensure_stop(state) for state in self.cameras.values()]
             if stops:
                 await asyncio.gather(*(asyncio.shield(task) for task in stops))
-            for state in states:
-                self.router.reset_camera(state.camera_id)
             self.cameras.clear()
             await self.router.close()
-            await self.devices.close()

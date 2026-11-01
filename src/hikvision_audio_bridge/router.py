@@ -1,4 +1,4 @@
-"""Bounded 20 ms fan-out and equal-gain mixing between devices and cameras."""
+"""Bounded server-side fan-out, grouped capture and equal-gain PCM mixing."""
 
 import asyncio
 import struct
@@ -7,11 +7,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
-from .config import Settings
-from .pipewire import BUFFER_BYTES, FRAME_BYTES, SILENCE
-
-FRAME_SECONDS = 0.02
-MAX_OUTPUT_FRAMES = 5
+from .audio import BUFFER_BYTES, BUFFER_FRAMES, FRAME_BYTES, FRAME_SECONDS, SILENCE
+from .config import AudioDevice, RoutingSettings
 
 
 class AudioIO(Protocol):
@@ -23,44 +20,29 @@ class AudioIO(Protocol):
 
 
 def camera_routes(
-    settings: Settings,
+    settings: RoutingSettings,
 ) -> tuple[dict[str, tuple[str, ...]], dict[str, tuple[str, ...]]]:
-    """Return enabled speaker and microphone IDs routed to each camera."""
     speaker: dict[str, list[str]] = {}
     microphone: dict[str, list[str]] = {}
-    for identifier in sorted(settings.devices):
-        device = settings.devices[identifier]
-        if not device.enabled:
-            continue
-        routes = speaker if device.direction == "speaker" else microphone
-        for camera_id in device.cameras:
-            routes.setdefault(camera_id, []).append(identifier)
+    for identifier, device in settings.devices.items():
+        if device.enabled:
+            routes = speaker if device.direction == "speaker" else microphone
+            for camera_id in device.cameras:
+                routes.setdefault(camera_id, []).append(identifier)
     return (
-        {key: tuple(value) for key, value in speaker.items()},
-        {key: tuple(value) for key, value in microphone.items()},
-    )
-
-
-def enabled_devices(settings: Settings, direction: str) -> tuple[str, ...]:
-    return tuple(
-        sorted(
-            identifier
-            for identifier, device in settings.devices.items()
-            if device.enabled and device.direction == direction
-        )
+        {key: tuple(sorted(value)) for key, value in speaker.items()},
+        {key: tuple(sorted(value)) for key, value in microphone.items()},
     )
 
 
 def _frame(pcm: bytes) -> bytes:
     if len(pcm) >= FRAME_BYTES:
         return pcm[:FRAME_BYTES]
-    if len(pcm) % 2:
-        pcm = pcm[:-1]
-    return pcm.ljust(FRAME_BYTES, b"\0")
+    return pcm[: len(pcm) // 2 * 2].ljust(FRAME_BYTES, b"\0")
 
 
 def mix(frames: list[bytes]) -> bytes:
-    """Mix active PCM16 frames with equal gain so the result cannot overflow."""
+    """Average active PCM16 frames, ignoring digital silence and avoiding clipping."""
     active = [_frame(frame) for frame in frames if any(frame)]
     if not active:
         return SILENCE
@@ -68,29 +50,21 @@ def mix(frames: list[bytes]) -> bytes:
         return active[0]
     samples = [struct.unpack("<160h", frame) for frame in active]
     gain = len(samples)
-    output = bytearray(FRAME_BYTES)
-    for index in range(160):
-        total = sum(row[index] for row in samples)
-        struct.pack_into("<h", output, index * 2, int(total / gain))
-    return bytes(output)
-
-
-@dataclass(frozen=True)
-class SpeechToken:
-    playback: "SpeechPlayback"
-    camera_id: str
+    return struct.pack(
+        "<160h",
+        *(int(sum(row[index] for row in samples) / gain) for index in range(160)),
+    )
 
 
 class SpeechPlayback:
-    """Synthesized PCM delivered once to every deduplicated target camera."""
-
     def __init__(self, pcm: bytes, targets: tuple[str, ...]):
         self.pcm = pcm
         self.targets = tuple(dict.fromkeys(targets))
-        self.frame_count = (len(pcm) + FRAME_BYTES - 1) // FRAME_BYTES if pcm else 0
+        self.frame_count = (len(pcm) + FRAME_BYTES - 1) // FRAME_BYTES
         self.queued = dict.fromkeys(self.targets, 0)
         self.delivered = dict.fromkeys(self.targets, 0)
         self.finished = asyncio.Event()
+        self.error: str | None = None
         if not self.targets or not self.frame_count:
             self.finished.set()
 
@@ -100,106 +74,58 @@ class SpeechPlayback:
 
     def delivered_frame(self, camera_id: str) -> None:
         self.delivered[camera_id] += 1
-        self.check_complete()
-
-    def check_complete(self) -> None:
-        if all(
-            self.queued[camera_id] >= self.frame_count
-            and self.delivered[camera_id] >= self.frame_count
-            for camera_id in self.targets
-        ):
+        if all(self.delivered[target] >= self.frame_count for target in self.targets):
             self.finished.set()
 
-
-@dataclass
-class Frame:
-    pcm: bytes
-    token: SpeechToken | None = None
+    def fail(self, message: str) -> None:
+        self.error = message
+        self.finished.set()
 
 
-class CameraOutput:
-    def __init__(self) -> None:
-        self.frames: deque[Frame] = deque()
-
-    def push(self, frame: Frame, *, protected: bool = False) -> bool:
-        if len(self.frames) >= MAX_OUTPUT_FRAMES:
-            if protected:
-                return False
-            for index, existing in enumerate(self.frames):
-                if existing.token is None:
-                    del self.frames[index]
-                    break
-            else:
-                return False
-        self.frames.append(frame)
-        return True
-
-    def pop(self) -> Frame:
-        return self.frames.popleft()
-
-    def clear_speech(self) -> None:
-        self.frames = deque(frame for frame in self.frames if frame.token is None)
+@dataclass(frozen=True)
+class SpeechToken:
+    playback: SpeechPlayback
+    camera_id: str
 
 
 class AudioRouter:
     def __init__(self, devices: Callable[[], AudioIO]):
         self._devices = devices
-        self.speakers: tuple[str, ...] = ()
-        self.microphones: tuple[str, ...] = ()
+        self.routes: dict[str, AudioDevice] = {}
         self.camera_speakers: dict[str, tuple[str, ...]] = {}
-        self.camera_microphones: dict[str, tuple[str, ...]] = {}
         self.microphone_cameras: dict[str, tuple[str, ...]] = {}
-        self.outputs: dict[str, CameraOutput] = {}
+        self.outputs: dict[str, deque[bytes]] = {}
         self.camera_inputs: dict[str, bytearray] = {}
         self.pending_delivery: dict[str, SpeechToken] = {}
         self.speech: SpeechPlayback | None = None
         self.task: asyncio.Task | None = None
 
-    def configure(self, settings: Settings) -> None:
-        """Install routes, discarding queued audio for changed camera paths."""
+    def configure(self, settings: RoutingSettings) -> None:
         speaker, microphone = camera_routes(settings)
-        microphones = enabled_devices(settings, "microphone")
-        old_speaker = self.camera_speakers
-        old_microphone = self.camera_microphones
-        flush_ids: set[str] = set()
-        for camera_id in set(old_speaker) | set(speaker):
-            if old_speaker.get(camera_id) != speaker.get(camera_id):
-                flush_ids.update(old_speaker.get(camera_id, ()))
-                flush_ids.update(speaker.get(camera_id, ()))
-        for camera_id in set(old_microphone) | set(microphone):
-            if old_microphone.get(camera_id) != microphone.get(camera_id):
-                flush_ids.update(old_microphone.get(camera_id, ()))
-                flush_ids.update(microphone.get(camera_id, ()))
-        if flush_ids:
-            try:
-                self._devices().flush(flush_ids)
-            except (KeyError, OSError):
-                pass
-        self.speakers = enabled_devices(settings, "speaker")
-        self.microphones = microphones
-        self.camera_speakers = speaker
-        self.camera_microphones = microphone
-        self.microphone_cameras = {
-            identifier: tuple(
-                sorted(
-                    camera_id
-                    for camera_id, devices in microphone.items()
-                    if identifier in devices
-                )
-            )
-            for identifier in microphones
+        changed = {
+            identifier
+            for identifier in self.routes.keys() | settings.devices.keys()
+            if self.routes.get(identifier) != settings.devices.get(identifier)
         }
-        for camera_id in set(old_speaker) | set(speaker):
-            if old_speaker.get(camera_id) != speaker.get(camera_id):
+        if changed:
+            self._devices().flush(changed)
+        for camera_id in self.camera_speakers.keys() | speaker.keys():
+            if self.camera_speakers.get(camera_id) != speaker.get(camera_id):
                 self.outputs.pop(camera_id, None)
-                self.pending_delivery.pop(camera_id, None)
-        for camera_id in set(old_microphone) | set(microphone):
-            if old_microphone.get(camera_id) != microphone.get(camera_id):
-                self.camera_inputs.pop(camera_id, None)
-        for camera_id in set(self.camera_inputs) - set(microphone):
+        self.routes = settings.devices
+        self.camera_speakers = speaker
+        self.microphone_cameras = {
+            identifier: device.cameras
+            for identifier, device in settings.devices.items()
+            if device.enabled and device.direction == "microphone"
+        }
+        for camera_id in set(self.camera_inputs) - microphone.keys():
             del self.camera_inputs[camera_id]
-        for camera_id in speaker:
-            self.outputs.setdefault(camera_id, CameraOutput())
+        targets = set(speaker)
+        if self.speech is not None:
+            targets.update(self.speech.targets)
+        for camera_id in targets:
+            self.outputs.setdefault(camera_id, deque(maxlen=BUFFER_FRAMES))
 
     def start(self) -> None:
         if self.task is None or self.task.done():
@@ -212,69 +138,34 @@ class AudioRouter:
             self.tick()
             deadline += FRAME_SECONDS
             delay = deadline - loop.time()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            else:
+            if delay <= 0:
                 deadline = loop.time()
-                await asyncio.sleep(0)
+            await asyncio.sleep(max(0, delay))
 
     def tick(self) -> None:
-        """One routing quantum: read each speaker and each camera input once."""
         devices = self._devices()
-        speaker_frames: dict[str, bytes] = {}
-        for identifier in self.speakers:
-            try:
-                speaker_frames[identifier] = devices.read_speaker(identifier)
-            except (KeyError, OSError):
-                speaker_frames[identifier] = SILENCE
-        routed_cameras: set[str] = set()
-        for cameras in self.microphone_cameras.values():
-            routed_cameras.update(cameras)
-        camera_frames = {
-            camera_id: self._camera_frame(camera_id)
-            for camera_id in sorted(routed_cameras)
+        speakers = {
+            identifier: devices.read_speaker(identifier)
+            for identifier, device in self.routes.items()
+            if device.enabled and device.direction == "speaker"
         }
-        cameras = set(self.camera_speakers)
-        if self.speech is not None:
-            cameras.update(self.speech.targets)
-        for camera_id in sorted(cameras):
-            output = self.outputs.get(camera_id)
-            if output is None:
-                continue
-            sources = [
-                speaker_frames.get(identifier, SILENCE)
-                for identifier in self.camera_speakers.get(camera_id, ())
-            ]
-            playback = self.speech
-            if playback is not None and camera_id in playback.targets:
-                index = playback.queued[camera_id]
-                if index < playback.frame_count:
-                    if len(output.frames) >= MAX_OUTPUT_FRAMES:
-                        continue
-                    token = SpeechToken(playback, camera_id)
-                    frame = Frame(mix([*sources, playback.frame(index)]), token)
-                    if output.push(frame, protected=True):
-                        playback.queued[camera_id] = index + 1
-                        playback.check_complete()
-                    continue
-            mixed = mix(sources)
-            if any(mixed):
-                output.push(Frame(mixed))
-        for identifier in self.microphones:
-            cameras = self.microphone_cameras.get(identifier, ())
-            frames = [camera_frames.get(camera_id, SILENCE) for camera_id in cameras]
-            try:
-                devices.write_microphone(identifier, mix(frames))
-            except (KeyError, OSError):
-                pass
+        for camera_id, identifiers in self.camera_speakers.items():
+            output = self.outputs.setdefault(camera_id, deque(maxlen=BUFFER_FRAMES))
+            output.append(mix([speakers[identifier] for identifier in identifiers]))
+        cameras = {
+            camera for targets in self.microphone_cameras.values() for camera in targets
+        }
+        captured = {camera: self._camera_frame(camera) for camera in cameras}
+        for identifier, targets in self.microphone_cameras.items():
+            devices.write_microphone(
+                identifier, mix([captured[camera] for camera in targets])
+            )
 
     def _camera_frame(self, camera_id: str) -> bytes:
         pending = self.camera_inputs.get(camera_id)
-        if pending is None:
+        if not pending:
             return SILENCE
         length = min(FRAME_BYTES, len(pending) // 2 * 2)
-        if not length:
-            return SILENCE
         pcm = bytes(pending[:length])
         del pending[:length]
         return pcm.ljust(FRAME_BYTES, b"\0")
@@ -284,46 +175,44 @@ class AudioRouter:
         pending.extend(pcm)
         if len(pending) > BUFFER_BYTES:
             excess = len(pending) - BUFFER_BYTES
-            excess += excess % 2
-            del pending[:excess]
+            del pending[: excess + excess % 2]
 
     def read_camera(self, camera_id: str) -> bytes:
-        """Return the next camera frame; confirms the previous frame was sent."""
+        """Pull TTS at upload pace; live-route edits never discard speech progress."""
         token = self.pending_delivery.pop(camera_id, None)
         if token is not None:
-            token.playback.delivered_frame(token.camera_id)
+            token.playback.delivered_frame(camera_id)
         output = self.outputs.get(camera_id)
-        if output is None or not output.frames:
-            return SILENCE
-        frame = output.pop()
-        if frame.token is not None:
-            self.pending_delivery[camera_id] = frame.token
-        return frame.pcm
+        live = output.popleft() if output else SILENCE
+        playback = self.speech
+        if playback is not None and camera_id in playback.targets:
+            index = playback.queued[camera_id]
+            if index < playback.frame_count:
+                playback.queued[camera_id] = index + 1
+                self.pending_delivery[camera_id] = SpeechToken(playback, camera_id)
+                return mix([live, playback.frame(index)])
+        return live
 
     def begin_speech(self, playback: SpeechPlayback) -> None:
         self.clear_speech()
         self.speech = playback
-        for camera_id in playback.targets:
-            self.outputs.setdefault(camera_id, CameraOutput())
 
     def clear_speech(self) -> None:
         self.speech = None
         self.pending_delivery.clear()
-        for output in self.outputs.values():
-            output.clear_speech()
 
     def reset_camera(self, camera_id: str) -> None:
         self.outputs.pop(camera_id, None)
         self.camera_inputs.pop(camera_id, None)
         self.pending_delivery.pop(camera_id, None)
+        if self.speech is not None and camera_id in self.speech.targets:
+            self.speech.fail(f"Speech stopped: camera '{camera_id}' is unavailable")
 
     async def close(self) -> None:
-        task = self.task
-        self.task = None
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        if self.task is not None:
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
+            self.task = None
         self.outputs.clear()
         self.camera_inputs.clear()
-        self.pending_delivery.clear()
-        self.speech = None
+        self.clear_speech()

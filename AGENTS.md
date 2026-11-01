@@ -2,41 +2,24 @@
 
 ## Project Overview
 
-A Linux user-session service routing multiple Hikvision ISAPI intercoms through independently named PipeWire speaker and microphone devices, with a configuration WebUI and optional online Edge TTS. It uses narrowband two-way audio, not RTSP/video, and neither records audio nor changes camera configuration. No root privileges or vendor SDK are required.
+One Python distribution with independently deployed camera-server and PipeWire-desktop components. The server centralizes Hikvision ISAPI channel ownership, logical client sessions, live mixing and queued Edge TTS. Each desktop owns its camera groups, multiple virtual devices and a separate WebUI. Audio is narrowband two-way audio, not RTSP/video. Neither component records audio or changes camera configuration.
 
-## Architecture & Data Flow
+## Architecture and Ownership
 
-Modules below live in `src/hikvision_audio_bridge/`:
+Modules live in `src/hikvision_audio_bridge/`:
 
-```mermaid
-flowchart LR
-    CLI["cli.py"] -->|Unix socket / JSON| Control["control.py"]
-    UI["static/ WebUI"] -->|HTTP(S) / JSON| Web["web.py"]
-    Web --> Control
-    Control --> Bridge["service.py: Bridge"]
-    Bridge --> Router["router.py: AudioRouter"]
-    Bridge --> Session["camera.py: one CameraSession per channel"]
-    Apps["Applications"] <-->|PipeWire / PCM FIFOs| Devices["pipewire.py: AudioDevices"]
-    Devices <-->|PCM16| Router
-    Router <-->|PCM16| Session
-    Bridge --> TTS["tts.py: Edge TTS / FFmpeg"]
-    TTS -->|PCM16| Router
-    Session <-->|ISAPI / G.711| Camera["Cameras"]
-```
+- `server.py: Gateway` owns server settings, scoped tokens, network sessions and `SpeechQueue`. `NetworkAudio` implements bounded PCM endpoints. Each WebSocket has an independent receive loop, ordered control worker and bounded sender; slow camera cleanup must not block unaffected PCM reception.
+- `service.py: CameraEngine` owns one `CameraSession` per configured physical channel, independent speaker/microphone tasks and shielded cleanup. It accepts a `CameraCredentials` provider and `AudioIO`; it does not own PipeWire, persistence or a desktop keyring.
+- `router.py: AudioRouter` fans speaker PCM out, mixes camera capture and overlays speech. TTS advances at camera upload pace and completes only after transport consumption. Live route changes must not discard speech progress or redirect job targets.
+- `desktop.py: DesktopBridge` owns desktop settings, PipeWire lifecycle and one `remote.py: RemoteAudio` WebSocket. Groups expand/deduplicate into session-local routes. Identical device IDs on different desktops must never collide at the server.
+- `web.py` serves `static/server/` or `static/desktop/`, sharing only `static/common.js` and CSS. Server admin, server audio and desktop UI credentials are separate. There is no JavaScript build step.
+- `control.py` hosts independent desktop/server daemons and same-UID Unix control. `cli.py` provides `hikvision-audio` (`main`) and `hikvision-audio-server` (`server_main`).
 
-- `Bridge` owns settings and per-camera worker/stream/cleanup state. Devices have stable IDs, independent switches and many-to-many camera routes. Overlapping routes share sessions; unrelated device changes or camera failures must not restart healthy streams. Camera changes/reconnects finish owned-session cleanup and flush affected buffers before opening a replacement.
-- Audio is 8 kHz mono: PCM16 locally, G.711 A-law or mu-law on the wire. Speaker frames are 20 ms: 320 PCM bytes become 160 encoded bytes. Keep frame size, PipeWire format and pacing consistent; bounded buffers discard stale audio.
-- `AudioRouter` reads each local speaker once per 20 ms tick before fanout and consumes each camera input once before microphone mixing. Preserve bounded queues and deduplicated TTS camera targets. TTS completion tracks transport consumption, not merely enqueued frames.
-- Speaker uses continuous `PUT /audioData`; microphone uses `GET /audioData`. `httpx` handles Digest-authenticated requests; speaker upload uses raw asyncio sockets and `h11`. Its initial empty HTTP 200 is only a handshake: preserve monitoring of later HTTP/XML errors.
-- Unix control uses newline-delimited JSON, a single-instance lock and same-UID peer checks. The WebUI shares its serialized dispatcher, requires bearer-token authentication and same-origin requests, defaults to loopback and requires TLS for nonloopback binding. Camera failures leave enabled virtual devices present and report per-camera errors; recovery requires explicit reconnect rather than an automatic credential retry loop.
+Camera identity changes/reconnects finish old-session cleanup and flush affected buffers before replacement. Unrelated device changes, slow clients and individual camera failures must not restart healthy streams. Camera/backend errors require explicit reconnect; never add automatic credential retry loops.
 
-## Key Directories
+Audio is PCM16 little-endian, 8 kHz mono. `audio.py` is authoritative for 20 ms / 320-byte frames, five-frame live buffers and the multiplexed WebSocket frame header. G.711 frames contain 160 bytes. Keep pacing, PipeWire format and wire framing consistent. Average active inputs to avoid clipping and discard stale live audio.
 
-| Directory | Purpose |
-| --- | --- |
-| `src/hikvision_audio_bridge/` | CLI, WebUI server/assets, routing, daemon orchestration, ISAPI transport, PipeWire, TTS and credentials. |
-| `tests/` | Configuration, audio, lifecycle, TTS and HTTP security regressions with loopback peers. |
-| `systemd/` | User-service unit and post-exit local-device cleanup. |
+Speaker ISAPI uses continuous `PUT /audioData`; microphone uses `GET /audioData`. `httpx` handles Digest requests; upload uses raw asyncio sockets and `h11`. Its initial empty HTTP 200 is only a handshake: preserve monitoring of later HTTP/XML errors. Do not assume physical cameras support independent simultaneous owners or session-isolated channel close.
 
 ## Development Commands
 
@@ -44,58 +27,48 @@ Run from the repository root:
 
 | Command | Purpose |
 | --- | --- |
-| `uv sync --frozen` | Install locked dependencies, including dev tools; also available as `make sync`. |
-| `uv build` | Build wheel and source distribution into `dist/`; there is no `make build`. |
+| `uv sync --frozen` | Install locked dependencies and dev tools; also `make sync`. |
 | `make check` | Ruff format check, Ruff lint, `ty check src`, then unittest discovery. |
-| `uv run ruff format .` | Apply formatting. |
-| `uv run ruff check .` | Run lint independently. |
-| `uv run hikvision-audio --help` | Inspect commands without starting the service. |
-| `uv run hikvision-audio serve` | Run the daemon in the foreground. |
-| `uv run hikvision-audio status` | Inspect a running daemon from another terminal. |
-| `uv run hikvision-audio web` | Open the authenticated WebUI for the running daemon. |
-| `make install` | Install the CLI/user unit and reload systemd; does not start or enable the service. |
+| `uv run ruff format .` | Apply Python formatting. |
+| `uv build` | Build wheel/sdist into `dist/`; there is no `make build`. |
+| `uv run hikvision-audio --help` | Inspect desktop commands without starting it. |
+| `uv run hikvision-audio-server --help` | Inspect headless server commands. |
+| `make install` | Install only the desktop CLI/user unit and reload systemd; does not start or enable it. |
 
-For an already installed CLI, update with `uv tool install --reinstall .`. The unit expects `%h/.local/bin/hikvision-audio`; start it explicitly with `systemctl --user start hikvision-audio.service`. Readiness means the control socket and WebUI listener are available, not that cameras authenticated. Do not restart a running deployment merely to test source changes; use isolated runtime/config paths and unique device IDs. Camera configuration, LAN/TLS and live-control examples are in `README.md`.
+For an installed desktop, update with `uv tool install --reinstall .`. The user unit expects `%h/.local/bin/hikvision-audio`. The server system unit expects `/opt/hikvision-audio/.venv/bin/hikvision-audio-server`, running as `hikvision-audio`. Both report readiness when control and WebUI listeners exist, not when cameras authenticate. Server CLI commands must use the service UID and matching state/runtime paths.
 
-## Code Conventions & Common Patterns
+Do not restart an installed deployment merely to test checkout changes. Use isolated directories and unique PipeWire IDs; preserve audio defaults and unrelated modules. Detailed installation, authentication and migration instructions are in `README.md`.
 
-- Ruff uses 88-column formatting and rules `E`, `F`, `I`, `UP`, `B`, `ASYNC`. Follow existing `snake_case` functions, `PascalCase` classes, uppercase constants, `_private_helpers`, package-relative imports and modern annotations (`X | None`, built-in generics).
-- Configuration uses frozen dataclasses and strict `from_dict` validation. `Settings` contains camera/device maps and `WebSettings`; reject unknown keys, non-boolean switches, duplicate channels/routes and unknown camera references. Keep one-way legacy settings migration and the published default device identities working.
-- Concurrency uses `asyncio` tasks, locks and events. Keep FIFO callbacks synchronous and nonblocking; move blocking Secret Service operations through `asyncio.to_thread`.
-- Preserve shared, shielded cleanup in `Bridge._ensure_stop` / `_stop_state` / `_finish_camera`. Caller cancellation must not cancel session close. Settle pending PipeWire operations before reconciling devices, stop streams before removing their devices, and reclaim only matching owned module names/FIFO paths. Retain cancelled TTS tasks until provider/subprocess cleanup completes.
-- Use `ValueError` for invalid input and `CameraError` / `RuntimeError` for operational failures. Preserve cancellation propagation and separate transport `error` from `cleanup_error`; do not hide failed cleanup.
-- Dependencies are passed explicitly, without a DI framework: `Paths` selects storage, `Bridge` accepts credentials, and tests replace `Bridge.devices` with `MemoryDevices`.
+## Code Conventions and Lifecycle
 
-## Important Files
+- Python 3.13+, modern annotations, package-relative imports, `snake_case`, `PascalCase` and uppercase constants. Ruff uses 88 columns and `E`, `F`, `I`, `UP`, `B`, `ASYNC`.
+- Configuration uses frozen dataclasses and strict validation. `ServerSettings` persists cameras/web; `DesktopSettings` persists backend/groups/devices/web; `RoutingSettings` is internal expanded routing, never persisted. Reject unknown fields, non-boolean switches, invalid references and duplicate physical channels/routes.
+- Preserve legacy desktop migration and stable device IDs/names/switches. The first desktop save backs up old non-secret settings privately. Never silently move camera passwords into desktop settings.
+- Keep FIFO callbacks synchronous and nonblocking. Move blocking Secret Service/vault operations through `asyncio.to_thread` when needed. Dependencies are explicit; no DI framework.
+- Preserve shared, shielded `CameraEngine` stop/close tasks, WebSocket cleanup and retained TTS tasks. Caller cancellation must not abandon camera close or provider/FFmpeg cleanup. Settle pending PipeWire enables before reconciliation; stop/pause affected streams before deleting devices.
+- `SpeechQueue` permits one active job and ten waiting jobs. Cancel/stop must wait for cleanup; queued text is never included in status or persisted. Synthesis remains in `tts.py`; the engine only consumes PCM.
+- Use `ValueError` for invalid control input and `CameraError` / `RuntimeError` for operational failures. Keep transport `error` distinct from `cleanup_error`; do not hide failed cleanup.
 
-- `pyproject.toml` and `uv.lock`: Python/dependency constraints, Hatchling packaging, tooling and console-script registration.
-- `Makefile`: authoritative setup, QA and installation commands.
-- `src/hikvision_audio_bridge/cli.py`: `hikvision-audio` entry point (`main`); command additions also affect validation/dispatch in `control.py`.
-- `src/hikvision_audio_bridge/config.py`: `Camera`, `AudioDevice`, `Settings`, `WebSettings`, `Paths`, strict schemas, migration and atomic writes. `credentials.py` is the Secret Service boundary.
-- `src/hikvision_audio_bridge/router.py`: 20 ms fanout/mixing and bounded speech/live buffers; `service.py` owns lifecycle and route reconciliation.
-- `src/hikvision_audio_bridge/web.py` and `static/`: aiohttp server, token/origin/TLS boundary and packaged plain-JavaScript UI; no Node.js build step.
-- `src/hikvision_audio_bridge/tts.py`: Edge MP3 synthesis and in-memory FFmpeg conversion, bounded input/output, cancellation-safe process ownership.
-- `systemd/hikvision-audio.service`: readiness notification, PipeWire dependency and `ExecStopPost` cleanup.
-- `README.md`: operational setup, supported audio behavior, manual validation notes and protocol references.
+## Security and Runtime Boundaries
 
-## Runtime/Tooling Preferences
+- Server state defaults to `/var/lib/hikvision-audio-server`, runtime to `/run/hikvision-audio-server`. `vault.py: ServerSecrets` stores Fernet-encrypted camera passwords and distinct persistent admin/audio tokens. Key/ciphertext files are owner-only; the service account and host/container root remain trusted. Losing the key must not silently regenerate over existing ciphertext.
+- Desktop settings default to `$XDG_CONFIG_HOME/hikvision-audio-bridge/settings.json`, mode `0600`. Socket, lock and FIFOs live under `$XDG_RUNTIME_DIR/hikvision-audio-bridge`, mode `0700`; `XDG_RUNTIME_DIR` and a logged-in desktop are required. `credentials.py: DesktopCredentials` stores only backend audio tokens in Secret Service.
+- Headless server operation must not require PipeWire, desktop Secret Service or login prompts. Desktop operation must never open ISAPI sessions or require camera passwords.
+- Non-loopback HTTP listeners/backend URLs are refused unless `allow_insecure_lan` is explicitly true. That flag permits plaintext, not arbitrary trust: deployed LAN HTTP/WS must be firewall-restricted to the approved subnet. Retain bearer authentication, same-origin checks and HTTPS certificate/hostname validation.
+- Management tokens, passwords and speech text must not appear in logs, command arguments or environment variables. The private runtime `web-access.json` is `0600`; login URLs and `audio-token` output are sensitive. Browser logout clears displayed secrets.
+- Use `uv.lock` and Hatchling. `audioop-lts` supplies G.711 conversion. Keep `.venv/`, caches, bytecode and `dist/` out of source changes. FFmpeg is required for online TTS and offline decoding tests, not ordinary live routing.
 
-- Use Python **3.13+** and **uv** with `uv.lock`; packaging uses Hatchling. `audioop-lts` supplies the G.711 conversion API removed from the standard library. Keep `.venv/`, caches, bytecode and `dist/` out of source changes.
-- Real operation needs a logged-in Linux user session, PipeWire, `pipewire-pulse`, WirePlumber, `pactl` and an unlocked desktop Secret Service. TTS and its offline decoding tests also require FFmpeg; live synthesis needs network access. Native PulseAudio and unattended boot without a desktop keyring are not supported deployment targets.
-- Settings live at `$XDG_CONFIG_HOME/hikvision-audio-bridge/settings.json`, mode `0600`. Socket, lock, PCM FIFOs and per-run `web-access.json` live under `$XDG_RUNTIME_DIR/hikvision-audio-bridge`, mode `0700`; the access file is `0600` and `XDG_RUNTIME_DIR` is required.
-- Camera passwords belong only in Secret Service. Accept them through the interactive CLI or authenticated WebUI; never add them to settings, status, command arguments, environment variables or logs. WebUI credentials require TLS outside loopback. Camera HTTPS retains certificate/hostname validation. Do not log speech text or management tokens.
-
-## Testing & QA
+## Testing and QA
 
 Use stdlib `unittest`, including `IsolatedAsyncioTestCase`, not pytest:
 
 ```sh
 uv run python -m unittest discover -s tests -v
-uv run python -m unittest discover -s tests -p 'test_service.py' -v
+uv run python -m unittest discover -s tests -p 'test_network.py' -v
 ```
 
-Use discovery: tests import `camera_peer` as a top-level helper. `tests/camera_peer.py` serves real loopback HTTP/TCP with Digest authentication; service tests substitute only desktop audio and credentials. Normal tests must not contact physical cameras, alter desktop devices or read real credentials.
+Use discovery: tests import `camera_peer` and `audio_helpers` as top-level helpers. `CameraPeer` serves real loopback Digest HTTP/TCP; network tests use actual WebSockets and replace only desktop hardware/credentials. Normal tests must not contact physical cameras, alter desktop audio or read real credentials.
 
-The suites cover strict/private configuration and migration, duplex audio, late upload errors, session ownership, independent devices, many-camera fanout/mixing, bounded queues, stale audio, targeted reconnect, cancellation, TTS conversion/cleanup and HTTP trust boundaries. Follow event/latch-based race tests rather than sleep-based timing. No coverage threshold or CI pipeline is configured; `make check` is the local QA gate and type-checks only `src/`.
+Cover shared camera ownership, identical client device IDs, fanout/grouped capture, independent directions/routes, slow cleanup, explicit recovery, cancellation-safe close, TTS FIFO/cancel and role authorization. Prefer event/latch-based races over sleeps. For deterministic mixed-tone assertions use frequencies with whole periods per 20 ms frame; bounded stale-frame dropping can otherwise change long-window phase coherence. No coverage threshold or CI is configured; `make check` type-checks only `src/`.
 
-PipeWire/FIFO integration, Secret Service prompts, WebUI browser interactions, TLS deployment, online TTS and systemd recovery need manual smoke checks when those paths change. The README records the separate real-device/loopback-peer smoke. No reusable end-to-end script is committed; loopback tests do not establish physical-camera firmware compatibility.
+Changed PipeWire, Secret Service, browser, LAN/TLS, TTS and systemd paths require separate runtime smoke checks. Real PipeWire volume/resampling means exact encoded-byte comparisons belong at the PCM/network boundary, not across arbitrary desktop processing. Check actual audio content, owned resource cleanup and preservation of existing services/default devices. Loopback peers cannot establish physical-camera firmware compatibility or physical audibility.

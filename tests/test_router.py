@@ -1,14 +1,9 @@
 import struct
 import unittest
 
-from hikvision_audio_bridge.config import AudioDevice, Camera, Settings
-from hikvision_audio_bridge.pipewire import SILENCE
-from hikvision_audio_bridge.router import (
-    MAX_OUTPUT_FRAMES,
-    AudioRouter,
-    SpeechPlayback,
-    mix,
-)
+from hikvision_audio_bridge.audio import BUFFER_FRAMES, SILENCE
+from hikvision_audio_bridge.config import AudioDevice, Camera, RoutingSettings
+from hikvision_audio_bridge.router import AudioRouter, SpeechPlayback, mix
 
 
 def pcm(value):
@@ -42,7 +37,7 @@ class FakeDevices:
 
 
 def settings(devices):
-    return Settings(
+    return RoutingSettings(
         cameras={
             "c1": Camera("http://c1.test", "admin"),
             "c2": Camera("http://c2.test", "admin"),
@@ -159,7 +154,6 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.router.begin_speech(playback)
         self.router.tick()
         self.router.tick()
-        self.assertEqual(playback.queued, {"c1": 2, "c2": 2})
         self.assertFalse(playback.finished.is_set())
 
         self.assertEqual(self.router.read_camera("c1"), first)
@@ -191,9 +185,7 @@ class RouterTests(unittest.IsolatedAsyncioTestCase):
         self.devices.frames["s1"] = [pcm(index) for index in range(1, 8)]
         for _ in range(7):
             self.router.tick()
-        values = [
-            sample(self.router.read_camera("c1")) for _ in range(MAX_OUTPUT_FRAMES)
-        ]
+        values = [sample(self.router.read_camera("c1")) for _ in range(BUFFER_FRAMES)]
         self.assertEqual(values, [3, 4, 5, 6, 7])
         self.assertEqual(self.router.read_camera("c1"), SILENCE)
 

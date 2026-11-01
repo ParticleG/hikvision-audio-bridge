@@ -8,11 +8,8 @@ import stat
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .config import AudioDevice, validate_id
-
-FRAME_BYTES = 320  # 20 ms of 8 kHz mono PCM16.
-BUFFER_BYTES = FRAME_BYTES * 5
-SILENCE = bytes(FRAME_BYTES)
+from .audio import BUFFER_BYTES, FRAME_BYTES
+from .config import DesktopDevice, validate_id
 
 
 def device_name(identifier: str) -> str:
@@ -49,7 +46,7 @@ class Device:
     module: str
     descriptor: int
     path: Path
-    settings: AudioDevice
+    settings: DesktopDevice
     pending: bytearray = field(default_factory=bytearray)
 
     def flush(self) -> None:
@@ -124,7 +121,7 @@ class AudioDevices:
         for identifier in list(self._operations):
             await self._settle(identifier)
 
-    async def enable(self, identifier: str, settings: AudioDevice) -> None:
+    async def enable(self, identifier: str, settings: DesktopDevice) -> None:
         validate_id(identifier)
         await self._settle(identifier)
         current = self.devices.get(identifier)
@@ -141,7 +138,7 @@ class AudioDevices:
         )
         await self._settle(identifier)
 
-    async def _enable(self, identifier: str, settings: AudioDevice) -> None:
+    async def _enable(self, identifier: str, settings: DesktopDevice) -> None:
         kind = "sink" if settings.direction == "speaker" else "source"
         path = self.runtime / f"{identifier}.pcm"
         try:

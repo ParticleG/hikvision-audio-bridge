@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Hikvision Camera Server</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to main content</a>
+  <header class="page-header">
+    <div class="brand">
+      <p class="eyebrow">Central camera backend</p>
+      <h1>Hikvision Camera Server</h1>
+      <p class="lede">One camera connection, shared audio sessions, and queued announcements.</p>
+    </div>
+    <div id="session-tools" class="session-tools" hidden>
+      <span class="session-pill">Server administrator</span>
+      <button class="button button-quiet" id="sign-out" type="button">Sign out</button>
+    </div>
+  </header>
+  <main id="main-content" class="page-main">
+    <section id="login-panel" class="panel login-panel">
+      <h2>Server sign in</h2>
+      <p>Use the private login URL from <code>hikvision-audio-server web --print-url</code>, or enter the server's admin token.</p>
+      <form id="login-form" method="post" action="/">
+        <div class="field"><label for="login-token">Admin access token</label><input id="login-token" type="password" autocomplete="off" required></div>
+        <div class="form-actions"><button class="button button-primary" type="submit">Sign in</button></div>
+        <p id="login-error" class="field-error" role="alert" hidden></p>
+      </form>
+    </section>
+    <div id="app" class="dashboard" hidden>
+      <div class="status-stack">
+        <p id="app-error" class="alert alert-error" role="alert" hidden></p>
+        <p id="app-notice" class="alert alert-success" role="status" hidden></p>
+        <p id="live-warning" class="alert alert-warning" hidden></p>
+      </div>
+      <section class="panel">
+        <div class="section-header"><div><h2>Cameras</h2><p class="section-intro">Credentials stay on this server. Camera failures require an explicit reconnect.</p></div></div>
+        <div id="camera-list" class="entity-list"></div>
+        <form id="camera-form" class="editor" method="post" action="/">
+          <h3 id="camera-editor-title">Add camera</h3>
+          <div class="form-grid">
+            <div class="field"><label for="camera-id">Camera ID</label><input id="camera-id" data-edit-id pattern="[a-z][a-z0-9_-]{0,47}" maxlength="48" placeholder="front-door" required></div>
+            <div class="field"><label for="camera-url">Camera URL</label><input id="camera-url" type="url" placeholder="http://192.0.2.10" required></div>
+            <div class="field"><label for="camera-username">Username</label><input id="camera-username" value="admin" autocomplete="off" required></div>
+            <div class="field"><label for="camera-channel">Audio channel</label><input id="camera-channel" type="number" min="1" max="65535" value="1" required></div>
+            <div class="field field-span"><label for="camera-password">Password</label><input id="camera-password" data-secret type="password" autocomplete="new-password"><p class="hint">Encrypted under the service account. Leave blank to retain the stored password.</p></div>
+          </div>
+          <div class="form-actions"><button class="button button-primary" type="submit">Save camera</button><button id="camera-clear" class="button button-quiet" type="button">New / clear form</button></div>
+        </form>
+      </section>
+      <section class="panel">
+        <h2>Desktop sessions</h2>
+        <p class="section-intro">Each desktop manages its own groups and virtual devices. Disconnecting one session leaves other desktops connected.</p>
+        <div id="session-list" class="entity-list"></div>
+        <div class="editor">
+          <h3>Connect a desktop</h3>
+          <p class="hint">Enter this server's URL and the audio token in the desktop WebUI. The audio token cannot change camera settings or use admin APIs.</p>
+          <button id="show-audio-token" class="button button-secondary" type="button">Show audio access token</button>
+          <div id="audio-token-panel" class="field" hidden>
+            <label for="audio-token">Audio access token</label><input id="audio-token" data-secret readonly autocomplete="off" spellcheck="false">
+            <button id="copy-audio-token" class="button button-quiet" type="button">Copy token</button>
+            <p class="hint">Share only with trusted desktops. On HTTP pages, select and copy manually if clipboard access is unavailable.</p>
+          </div>
+        </div>
+      </section>
+      <section class="panel panel-full">
+        <div class="section-header"><div><h2>Text to speech</h2><p class="section-intro">Announcements play in FIFO order. Live desktop playback continues and is mixed with the current announcement.</p></div><span id="tts-state" class="badge badge-idle">idle</span></div>
+        <form id="tts-form" method="post" action="/">
+          <div class="form-grid">
+            <div class="field"><label for="tts-cameras">Target cameras</label><select id="tts-cameras" multiple size="5" required></select><p class="hint">Hold Ctrl or Command to select multiple cameras. No desktop device is required.</p></div>
+            <div class="field"><label for="tts-voice">Edge voice</label><input id="tts-voice" value="zh-CN-XiaoxiaoNeural" maxlength="100" required><p class="hint">Online Edge TTS sends the entered text to Microsoft's speech service.</p></div>
+            <div class="field field-span"><label for="tts-text">Announcement</label><textarea id="tts-text" data-secret maxlength="2000" rows="4" required></textarea><p class="hint">Up to 2,000 characters and 120 seconds per announcement. Audio is not recorded.</p></div>
+          </div>
+          <div class="form-actions"><button class="button button-primary" type="submit">Queue announcement</button><button id="tts-stop" class="button button-danger" type="button">Stop and clear queue</button></div>
+        </form>
+        <div id="tts-jobs" class="entity-list editor"></div>
+        <p id="tts-last" class="hint" role="status"></p>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

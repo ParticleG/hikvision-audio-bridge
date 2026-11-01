@@ -1,1 +1,1 @@
-"""User-session Hikvision audio bridge for PipeWire."""
+"""Central camera audio server and independent PipeWire desktop components."""

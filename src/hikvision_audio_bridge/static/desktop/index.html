@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Hikvision Desktop Audio</title>
+  <link rel="stylesheet" href="/style.css">
+  <script type="module" src="/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to main content</a>
+  <header class="page-header">
+    <div class="brand"><p class="eyebrow">Local PipeWire devices</p><h1>Hikvision Desktop Audio</h1><p class="lede">Group remote cameras into independent speakers and microphones on this computer.</p></div>
+    <div id="session-tools" class="session-tools" hidden><span class="session-pill">Desktop session</span><button id="sign-out" class="button button-quiet" type="button">Sign out</button></div>
+  </header>
+  <main id="main-content" class="page-main">
+    <section id="login-panel" class="panel login-panel">
+      <h2>Desktop sign in</h2><p>Open <code>hikvision-audio web</code>, or enter the local WebUI token. This is separate from the backend's audio token.</p>
+      <form id="login-form" method="post" action="/"><div class="field"><label for="login-token">Local WebUI token</label><input id="login-token" type="password" autocomplete="off" required></div><div class="form-actions"><button class="button button-primary" type="submit">Sign in</button></div><p id="login-error" class="field-error" role="alert" hidden></p></form>
+    </section>
+    <div id="app" class="dashboard" hidden>
+      <div class="status-stack"><p id="app-error" class="alert alert-error" role="alert" hidden></p><p id="app-notice" class="alert alert-success" role="status" hidden></p><p id="live-warning" class="alert alert-warning" hidden></p></div>
+      <section class="panel panel-full">
+        <div class="section-header"><div><h2>Camera backend</h2><p class="section-intro">This desktop never connects directly to cameras or stores their passwords.</p></div><span id="backend-state" class="badge badge-idle">idle</span></div>
+        <p id="backend-error" class="field-error" role="alert" hidden></p>
+        <p id="backend-transport" class="hint"></p>
+        <div class="form-actions"><button id="backend-reconnect" class="button button-secondary" type="button">Reconnect backend</button><button id="backend-disconnect" class="button button-quiet" type="button">Remove backend</button></div>
+        <form id="backend-form" class="editor" method="post" action="/">
+          <div class="form-grid">
+            <div class="field"><label for="backend-url">Backend URL</label><input id="backend-url" type="url" placeholder="https://audio.example.org" required></div>
+            <div class="field"><label for="backend-name">Desktop session name</label><input id="backend-name" value="Desktop" maxlength="100" required></div>
+            <div class="field"><label for="backend-token">Audio access token</label><input id="backend-token" data-secret type="password" autocomplete="new-password"><p class="hint">Stored in desktop Secret Service. Leave blank to reuse the stored token; never enter a camera password or server admin token.</p></div>
+            <div class="field"><label for="backend-ca">Additional trusted CA file</label><input id="backend-ca" placeholder="Optional local PEM path"><p class="hint">HTTPS keeps certificate and hostname validation enabled.</p></div>
+            <div class="field field-span"><label class="checkbox-label"><input id="backend-insecure" type="checkbox">Allow plaintext LAN HTTP/WS for this backend</label><p class="hint">Only enable on a trusted network. Audio and access tokens will be unencrypted in transit.</p></div>
+          </div>
+          <div class="form-actions"><button class="button button-primary" type="submit">Save and connect</button><button id="backend-reset" class="button button-quiet" type="button">Reset form to saved settings</button></div>
+        </form>
+      </section>
+      <section class="panel">
+        <h2>Camera groups</h2><p class="section-intro">Groups belong to this desktop. A device can use several groups; overlapping cameras are routed only once.</p>
+        <div id="group-list" class="entity-list"></div>
+        <form id="group-form" class="editor" method="post" action="/">
+          <h3 id="group-editor-title">Add camera group</h3>
+          <div class="form-grid">
+            <div class="field"><label for="group-id">Group ID</label><input id="group-id" data-edit-id pattern="[a-z][a-z0-9_-]{0,47}" maxlength="48" placeholder="office" required></div>
+            <div class="field"><label for="group-name">Group name</label><input id="group-name" maxlength="100" required></div>
+            <div class="field field-span"><label for="group-cameras">Cameras</label><select id="group-cameras" multiple size="6"></select><p class="hint">Hold Ctrl or Command to select multiple cameras. Connect the backend to discover available cameras.</p></div>
+          </div>
+          <div class="form-actions"><button class="button button-primary" type="submit">Save group</button><button id="group-clear" class="button button-quiet" type="button">New / clear form</button></div>
+        </form>
+      </section>
+      <section class="panel">
+        <h2>Virtual audio devices</h2><p class="section-intro">Speakers send desktop playback to grouped cameras. Microphones receive the server's mixed camera audio.</p>
+        <div id="device-list" class="entity-list"></div>
+        <form id="device-form" class="editor" method="post" action="/">
+          <h3 id="device-editor-title">Add audio device</h3>
+          <div class="form-grid">
+            <div class="field"><label for="device-id">Device ID</label><input id="device-id" data-edit-id pattern="[a-z][a-z0-9_-]{0,47}" maxlength="48" placeholder="office-speaker" required></div>
+            <div class="field"><label for="device-name">Display name</label><input id="device-name" maxlength="100" required></div>
+            <div class="field"><label for="device-direction">Direction</label><select id="device-direction"><option value="speaker">Speaker</option><option value="microphone">Microphone</option></select></div>
+            <div class="field"><label for="device-groups">Camera groups</label><select id="device-groups" multiple size="5"></select></div>
+            <div class="field field-span"><label class="checkbox-label"><input id="device-enabled" type="checkbox" checked>Enable this device</label></div>
+          </div>
+          <div class="form-actions"><button class="button button-primary" type="submit">Save device</button><button id="device-clear" class="button button-quiet" type="button">New / clear form</button></div>
+        </form>
+      </section>
+    </div>
+  </main>
+</body>
+</html>

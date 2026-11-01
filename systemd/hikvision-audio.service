@@ -1,5 +1,5 @@
 [Unit]
-Description=Hikvision camera speaker and microphone bridge
+Description=Hikvision desktop network audio devices and local WebUI
 After=pipewire-pulse.service
 Requires=pipewire-pulse.service
 PartOf=pipewire-pulse.service

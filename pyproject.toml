@@ -4,12 +4,13 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hikvision-audio-bridge"
-version = "0.1.0"
-description = "Multi-camera PipeWire audio routing with a configuration WebUI and TTS"
+version = "0.2.0"
+description = "Central Hikvision camera audio server and independent PipeWire desktops"
 requires-python = ">=3.13"
 dependencies = [
   "aiohttp>=3.12,<4",
   "audioop-lts>=0.2.2",
+  "cryptography>=43",
   "edge-tts>=7.2,<8",
   "h11>=0.16,<1",
   "httpx>=0.28.1,<1",
@@ -18,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 hikvision-audio = "hikvision_audio_bridge.cli:main"
+hikvision-audio-server = "hikvision_audio_bridge.cli:server_main"
 
 [dependency-groups]
 dev = ["ruff>=0.12", "ty>=0.0.1"]
