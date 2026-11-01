@@ -10,6 +10,7 @@ import audioop
 from audio_helpers import AudioCredentials, MemoryDevices, magnitude, pcm, received
 from camera_peer import CameraPeer
 
+from hikvision_audio_bridge.chimes import chime_pcm
 from hikvision_audio_bridge.config import (
     BackendSettings,
     Camera,
@@ -255,3 +256,72 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
                     receipt = (await response.json())["status"]
                     self.assertEqual(receipt["id"], identifier)
                     self.assertEqual(receipt["state"], expected)
+
+    async def test_status_chimes_precede_speech_on_every_camera_transport(self):
+        speech = pcm(18000) * 5
+
+        async def provider(_text, _voice):
+            return speech
+
+        async with aiohttp.ClientSession(trust_env=False) as client:
+            for chime in (None, "success", "warning", "error"):
+                with self.subTest(chime=chime):
+                    checkpoints = [
+                        len(peer.received) for peer in (self.front, self.back)
+                    ]
+                    command = {
+                        "op": "tts.speak",
+                        "text": "Transport check",
+                        "cameras": ["front", "back"],
+                    }
+                    if chime is not None:
+                        command["chime"] = chime
+                    with patch(
+                        "hikvision_audio_bridge.server.synthesize", new=provider
+                    ):
+                        async with client.post(
+                            self.web.url + "/api/command",
+                            headers={
+                                "Authorization": f"Bearer {self.gateway.admin_token}"
+                            },
+                            json=command,
+                        ) as response:
+                            self.assertEqual(
+                                response.status, 200, await response.text()
+                            )
+                            identifier = (await response.json())["status"]["queued_job"]
+                        await asyncio.wait_for(self.gateway.speech.worker, 5)
+                    expected = speech
+                    if chime is not None:
+                        expected = chime_pcm(chime) + bytes(3200) + speech
+                    encoded = audioop.lin2alaw(expected, 2)
+                    for peer, checkpoint in zip(
+                        (self.front, self.back), checkpoints, strict=True
+                    ):
+                        self.assertIn(encoded, peer.received[checkpoint:])
+                        self.assertEqual(peer.opened, peer.closed)
+                    receipt = self.gateway.speech.job_status(identifier)
+                    self.assertEqual(receipt["state"], "completed")
+
+    async def test_cancelling_during_chime_does_not_send_speech_to_cameras(self):
+        speech = pcm(18000) * 5
+        cue_start = audioop.lin2alaw(chime_pcm("error")[:320], 2)
+
+        async def provider(_text, _voice):
+            return speech
+
+        with patch("hikvision_audio_bridge.server.synthesize", new=provider):
+            identifier = self.gateway.speech.enqueue(
+                "Cancel during cue", ["front", "back"], DEFAULT_VOICE, "error"
+            )
+            async with asyncio.timeout(5):
+                while cue_start not in self.front.received:
+                    self.front.received_audio.clear()
+                    await self.front.received_audio.wait()
+            await self.gateway.speech.cancel(identifier)
+        for peer in (self.front, self.back):
+            self.assertNotIn(audioop.lin2alaw(speech[:320], 2), peer.received)
+            self.assertEqual(peer.opened, peer.closed)
+        self.assertEqual(
+            self.gateway.speech.job_status(identifier)["state"], "cancelled"
+        )

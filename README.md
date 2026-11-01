@@ -225,6 +225,33 @@ convert MP3 to PCM16. Text and synthesized audio are kept in memory, never audio
 - Status exposes job IDs, targets, voices and outcomes, not announcement text.
   Completion tracks camera-transport consumption, not the camera's internal speaker buffer.
 
+Automation clients may add an optional `chime` field to `tts.speak` (`success`,
+`warning` or `error`; server 0.2.2 or newer) to sound a status cue before the
+spoken text:
+
+```json
+{"op":"tts.speak","text":"Door opened","cameras":["entrance"],"chime":"success"}
+```
+
+Omitting `chime` keeps the earlier speech-only behaviour, so existing clients are
+unchanged. Unknown names and non-string values are rejected before the job is
+queued; `chime` is not echoed in job status. The cue is a packaged 8 kHz mono
+PCM16 WAV followed by 200 ms of silence, prepended to the synthesized speech in
+the same queue job and the same camera upload. It therefore obeys normal FIFO
+order, target selection, cancellation and transport-completion tracking, and a
+job cancelled before or during synthesis never plays the cue alone. The server
+does not download chimes or invoke FFmpeg to prepare them at runtime. An updated
+deployment must replace the installed package files: rerun
+`uv sync --frozen --no-dev --no-editable` in `/opt/hikvision-audio` for the
+server or `uv tool install --reinstall .` for the desktop. A running service
+still needs its normal restart before the new code is loaded.
+
+The WAV cues derive from Kenney's "Interface Sounds" pack
+(<https://kenney.nl/assets/interface-sounds>), released under CC0 1.0, so no
+attribution is required and no CC-BY obligations apply. Original asset names,
+conversion commands and the pack's license text are kept in
+`src/hikvision_audio_bridge/chimes/ATTRIBUTION.md` and `LICENSE.txt`.
+
 Automation clients can use `POST /api/command` with `{"op":"tts.get","id":"JOB_ID"}`
 and the admin bearer token to follow one queued job (server 0.2.1 or newer).
 The response's `status` contains `id`, `cameras`, `voice`, `state` and nullable `error`.

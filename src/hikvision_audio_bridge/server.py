@@ -16,6 +16,7 @@ from .audio import (
     decode_frame,
     encode_frame,
 )
+from .chimes import prepend_chime, validate_chime
 from .config import (
     AudioDevice,
     Paths,
@@ -129,6 +130,7 @@ class SpeechJob:
     text: str
     cameras: tuple[str, ...]
     voice: str
+    chime: str | None = None
 
     def public(self) -> dict:
         return {
@@ -187,10 +189,14 @@ class SpeechQueue:
             "capacity": MAX_QUEUED_SPEECH,
         }
 
-    def enqueue(self, text: str, cameras: list[str], voice: str) -> str:
+    def enqueue(
+        self, text: str, cameras: list[str], voice: str, chime: str | None = None
+    ) -> str:
         if not isinstance(text, str) or not isinstance(voice, str):
             raise ValueError("Speech text and voice must be strings")
         text, voice = _validate_text(text), _validate_voice(voice)
+        if chime is not None:
+            chime = validate_chime(chime)
         if self.closing:
             raise RuntimeError("Speech queue is stopping")
         if not isinstance(cameras, list) or not cameras:
@@ -200,7 +206,7 @@ class SpeechQueue:
             raise ValueError("Unknown speech target camera")
         if len(self.pending) >= MAX_QUEUED_SPEECH:
             raise ValueError("Speech queue is full")
-        job = SpeechJob(secrets.token_hex(8), text, targets, voice)
+        job = SpeechJob(secrets.token_hex(8), text, targets, voice, chime)
         self.pending.append(job)
         if self.worker is None or self.worker.done():
             self.worker = asyncio.create_task(self._run())
@@ -214,7 +220,7 @@ class SpeechQueue:
     async def _play(self, job: SpeechJob) -> None:
         pcm = await synthesize(job.text, job.voice)
         self.stage = "playing"
-        await self.engine.play_pcm(pcm, job.cameras)
+        await self.engine.play_pcm(prepend_chime(job.chime, pcm), job.cameras)
 
     async def _run(self) -> None:
         try:
@@ -409,12 +415,16 @@ class Gateway:
             elif (
                 operation == "tts.speak"
                 and {"op", "text", "cameras"} <= set(command)
-                and not set(command) - {"op", "text", "cameras", "voice"}
+                and not set(command) - {"op", "text", "cameras", "voice", "chime"}
             ):
+                chime = None
+                if "chime" in command:
+                    chime = validate_chime(command["chime"])
                 identifier = self.speech.enqueue(
                     command["text"],
                     command["cameras"],
                     command.get("voice", DEFAULT_VOICE),
+                    chime,
                 )
                 return {**self.status(), "queued_job": identifier}
             elif operation == "tts.cancel" and set(command) == {"op", "id"}:
