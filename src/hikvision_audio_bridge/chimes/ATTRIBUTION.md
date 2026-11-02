@@ -1,27 +1,46 @@
 # Bundled status chimes
 
-These WAV files are derived from the Kenney "Interface Sounds" 1.0 pack,
-published under Creative Commons Zero (CC0 1.0):
-<https://kenney.nl/assets/interface-sounds> and
-<https://creativecommons.org/publicdomain/zero/1.0/>. The pack's original
-`License.txt` is preserved here verbatim; attribution to Kenney is not
-mandatory but is recorded for provenance.
+These WAV files are rendered from
+[simple-notification-sounds](https://github.com/Stieneee/simple-notification-sounds)
+by Tyler Stiene, commit `b518f14c651265f28d9dc9df1793a48294186d9e`, released under
+the MIT License. The library synthesizes its sounds with Tone.js in a browser and
+does not ship audio files. Its license text is preserved verbatim in
+`LICENSE.txt`.
 
-| File | Original asset | Duration |
-| --- | --- | --- |
-| `success.wav` | `Audio/confirmation_001.ogg` | 0.290 s |
-| `warning.wav` | `Audio/question_004.ogg` | 0.333 s |
-| `error.wav` | `Audio/error_006.ogg` | 0.500 s |
+| Tone        | `short` | `medium` | `long`  |
+| ----------- | ------- | -------- | ------- |
+| `success`   | 0.508 s | 0.762 s  | 1.594 s |
+| `attention` | 0.600 s | 0.849 s  | 1.454 s |
+| `alert`     | 0.596 s | 0.630 s  | 1.315 s |
+| `warning`   | 0.521 s | 0.772 s  | 2.169 s |
+| `error`     | 0.447 s | 0.646 s  | 1.790 s |
 
-Each cue was converted once while authoring, never at runtime, from the
-official pack with FFmpeg 9:
+Files were rendered once while authoring. The server never synthesizes, downloads
+or decodes cues at runtime:
+
+1. Install the library's locked dependencies with `npm ci` (`tone` 15.0.4,
+   `standardized-audio-context` 25.3.77).
+2. In Chromium, call each unmodified `src/sounds/<tone>.js` export with its
+   duration inside `Tone.Offline(callback, 4, 1, 48000)`: a 4 s, mono, 48 kHz
+   offline render.
+3. Trim samples quieter than 0.1% of the clip peak (-60 dB) from both ends and
+   keep a 10 ms tail.
+4. Resample to 8 kHz with FFmpeg's soxr resampler, normalize each cue to a -3
+   dBFS peak, and store mono PCM16 WAV:
 
 ```sh
-ffmpeg -i Audio/confirmation_001.ogg -af volume=-5dB -ac 1 -ar 8000 \
-  -c:a pcm_s16le -map_metadata -1 success.wav
+ffmpeg -f f32le -ar 48000 -ac 1 -i trimmed.f32 \
+  -af aresample=8000:resampler=soxr:precision=28 -f f32le -ac 1 cue.8k.f32
+ffmpeg -f f32le -ar 8000 -ac 1 -i cue.8k.f32 -af volume=<gain>dB \
+  -c:a pcm_s16le -map_metadata -1 -fflags +bitexact -flags:a +bitexact \
+  <tone>-<duration>.wav
 ```
 
-The result is 8 kHz mono PCM16 WAV with peaks near -6 dBFS, leaving digital
-headroom. `chimes.py` strips the WAV header and inserts 200 ms of silence
-between the cue and synthesized speech. Physical speaker volume and audibility
-depend on the camera and its configuration.
+Each cue is peak-normalized to -3 dBFS so it stays audible on camera speakers
+while leaving headroom. The library's own renders peak between about -5 and -12
+dBFS, and resampling to 8 kHz changed those peaks by less than 1 dB; the
+per-cue normalization therefore deliberately does not preserve the library's
+relative loudness.
+The long attention and warning cues contain random noise bursts; re-rendering
+produces equivalent but not bit-identical files. Physical speaker volume and
+audibility depend on the camera and its configuration.

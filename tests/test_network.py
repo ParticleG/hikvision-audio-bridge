@@ -10,7 +10,7 @@ import audioop
 from audio_helpers import AudioCredentials, MemoryDevices, magnitude, pcm, received
 from camera_peer import CameraPeer
 
-from hikvision_audio_bridge.chimes import chime_pcm
+from hikvision_audio_bridge.chimes import Chime, chime_pcm
 from hikvision_audio_bridge.config import (
     BackendSettings,
     Camera,
@@ -263,9 +263,14 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
         async def provider(_text, _voice):
             return speech
 
+        cases = (
+            (None, 1),
+            (Chime("success", "short"), 1),
+            (Chime("error", "medium"), 2),
+        )
         async with aiohttp.ClientSession(trust_env=False) as client:
-            for chime in (None, "success", "warning", "error"):
-                with self.subTest(chime=chime):
+            for chime, plays in cases:
+                with self.subTest(chime=chime, plays=plays):
                     checkpoints = [
                         len(peer.received) for peer in (self.front, self.back)
                     ]
@@ -273,9 +278,13 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
                         "op": "tts.speak",
                         "text": "Transport check",
                         "cameras": ["front", "back"],
+                        "plays": plays,
                     }
                     if chime is not None:
-                        command["chime"] = chime
+                        command["chime"] = {
+                            "tone": chime.tone,
+                            "duration": chime.duration,
+                        }
                     with patch(
                         "hikvision_audio_bridge.server.synthesize", new=provider
                     ):
@@ -290,10 +299,13 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
                                 response.status, 200, await response.text()
                             )
                             identifier = (await response.json())["status"]["queued_job"]
-                        await asyncio.wait_for(self.gateway.speech.worker, 5)
-                    expected = speech
+                        await asyncio.wait_for(self.gateway.speech.worker, 10)
+                    # Contract: 200 ms after the cue and 1 s between plays,
+                    # as 8 kHz PCM16 silence, with no leading or trailing gap.
+                    pass_pcm = speech
                     if chime is not None:
-                        expected = chime_pcm(chime) + bytes(3200) + speech
+                        pass_pcm = chime_pcm(chime) + bytes(3200) + speech
+                    expected = bytes(16000).join([pass_pcm] * plays)
                     encoded = audioop.lin2alaw(expected, 2)
                     for peer, checkpoint in zip(
                         (self.front, self.back), checkpoints, strict=True
@@ -305,14 +317,18 @@ class NetworkTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancelling_during_chime_does_not_send_speech_to_cameras(self):
         speech = pcm(18000) * 5
-        cue_start = audioop.lin2alaw(chime_pcm("error")[:320], 2)
+        chime = Chime("error", "long")
+        cue_start = audioop.lin2alaw(chime_pcm(chime)[:320], 2)
 
         async def provider(_text, _voice):
             return speech
 
         with patch("hikvision_audio_bridge.server.synthesize", new=provider):
             identifier = self.gateway.speech.enqueue(
-                "Cancel during cue", ["front", "back"], DEFAULT_VOICE, "error"
+                "Cancel during cue",
+                ["front", "back"],
+                DEFAULT_VOICE,
+                {"tone": "error", "duration": "long"},
             )
             async with asyncio.timeout(5):
                 while cue_start not in self.front.received:

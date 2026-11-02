@@ -9,7 +9,9 @@ from unittest.mock import patch
 
 from hikvision_audio_bridge.chimes import (
     CHIME_DIRECTORY,
-    CHIME_NAMES,
+    CHIME_DURATIONS,
+    CHIME_TONES,
+    Chime,
     chime_pcm,
 )
 from hikvision_audio_bridge.config import Camera, Paths
@@ -51,37 +53,61 @@ class ChimeTests(unittest.IsolatedAsyncioTestCase):
 
         return patch.object(self.bridge.engine, "play_pcm", new=play)
 
-    def test_bundled_cues_are_short_eight_kilohertz_mono_pcm(self):
-        cues = {}
-        for name in CHIME_NAMES:
-            with self.subTest(chime=name):
-                pcm = chime_pcm(name)
-                self.assertTrue(pcm)
-                self.assertEqual(len(pcm) % 2, 0)
-                samples = struct.unpack(f"<{len(pcm) // 2}h", pcm)
-                peak = max(abs(sample) for sample in samples)
-                # Audible on a camera speaker with headroom rather than clipping.
-                self.assertGreater(peak, 0.05 * 32768)
-                self.assertLess(peak, 0.75 * 32768)
-                self.assertTrue(0.05 <= len(pcm) / 16000 <= 1.0)
-                cues[name] = pcm
-        self.assertEqual(len(set(cues.values())), len(CHIME_NAMES))
+    def test_packaged_cues_match_every_tone_and_duration(self):
+        expected = {
+            f"{tone}-{duration}.wav"
+            for tone in CHIME_TONES
+            for duration in CHIME_DURATIONS
+        }
         packaged = sorted(CHIME_DIRECTORY.glob("*.wav"))
-        self.assertEqual(len(packaged), len(CHIME_NAMES))
+        self.assertEqual({path.name for path in packaged}, expected)
+        self.assertEqual(len(packaged), len(CHIME_TONES) * len(CHIME_DURATIONS))
+        cues = set()
         for path in packaged:
-            with self.subTest(packaged=path.name), wave.open(str(path)) as archive:
-                self.assertEqual(archive.getnchannels(), 1)
-                self.assertEqual(archive.getsampwidth(), 2)
-                self.assertEqual(archive.getframerate(), 8000)
+            with self.subTest(packaged=path.name):
+                with wave.open(str(path)) as archive:
+                    self.assertEqual(archive.getnchannels(), 1)
+                    self.assertEqual(archive.getsampwidth(), 2)
+                    self.assertEqual(archive.getframerate(), 8000)
+                    self.assertEqual(archive.getcomptype(), "NONE")
+                    frames = archive.readframes(archive.getnframes())
+                self.assertTrue(frames)
+                self.assertEqual(len(frames) % 2, 0)
+                samples = struct.unpack(f"<{len(frames) // 2}h", frames)
+                peak = max(abs(sample) for sample in samples)
+                self.assertGreater(peak, 0)
+                # Rendered cues keep headroom instead of sitting on the int16 rails.
+                self.assertLess(peak, 32767)
+                cues.add(frames)
+        self.assertEqual(len(cues), len(expected))
+        for tone in CHIME_TONES:
+            for duration in CHIME_DURATIONS:
+                with self.subTest(tone=tone, duration=duration):
+                    self.assertIn(chime_pcm(Chime(tone, duration)), cues)
 
-    async def test_invalid_chime_is_rejected_before_any_playback(self):
+    async def test_invalid_chime_and_plays_are_rejected_before_playback(self):
         queue = self.bridge.speech
+        invalid_chimes = (
+            "success",
+            {},
+            {"tone": "success"},
+            {"duration": "short"},
+            {"tone": "success", "duration": "short", "extra": 1},
+            {"tone": 1, "duration": "short"},
+            {"tone": "success", "duration": 2},
+            {"tone": "chime", "duration": "short"},
+            {"tone": "success", "duration": "forever"},
+            ["success", "short"],
+            None,
+        )
+        invalid_plays = (0, 6, True, 1.5, "2", None)
+        valid_chime = {"tone": "success", "duration": "short"}
 
         async def provider(_text, _voice):
             raise AssertionError("synthesis must not start")
 
         with patch("hikvision_audio_bridge.server.synthesize", new=provider):
-            for chime in ("chime", "", "SUCCESS", 1, True, b"success", None):
+            for chime in invalid_chimes:
                 with self.subTest(chime=chime):
                     with self.assertRaises(ValueError):
                         await self.bridge.dispatch(
@@ -92,29 +118,56 @@ class ChimeTests(unittest.IsolatedAsyncioTestCase):
                                 "chime": chime,
                             }
                         )
-            for chime in ("chime", "", "SUCCESS", 1, True, b"success"):
-                with self.subTest(enqueue=chime), self.assertRaises(ValueError):
-                    queue.enqueue("hello", ["front"], DEFAULT_VOICE, chime)
+                    if chime is not None:
+                        with self.assertRaises(ValueError):
+                            queue.enqueue("hello", ["front"], DEFAULT_VOICE, chime)
+            for plays in invalid_plays:
+                with self.subTest(plays=plays):
+                    with self.assertRaises(ValueError):
+                        await self.bridge.dispatch(
+                            {
+                                "op": "tts.speak",
+                                "text": "hello",
+                                "cameras": ["front"],
+                                "chime": valid_chime,
+                                "plays": plays,
+                            }
+                        )
+                    with self.assertRaises(ValueError):
+                        queue.enqueue(
+                            "hello",
+                            ["front"],
+                            DEFAULT_VOICE,
+                            valid_chime,
+                            plays,
+                        )
         self.assertIsNone(queue.worker)
+        self.assertIsNone(queue.current)
+        self.assertEqual(queue.stage, "idle")
         self.assertEqual(queue.status()["queue"], [])
         self.assertEqual(queue.completed, {})
         self.assertEqual(self.played, [])
 
-    async def test_omitted_chime_plays_speech_only_with_unchanged_receipts(self):
+    async def test_omitted_chime_and_plays_play_speech_only(self):
         queue = self.bridge.speech
         with (
             patch("hikvision_audio_bridge.server.synthesize", new=self.provider),
             self.recording_play(),
         ):
+            result = await self.bridge.dispatch(
+                {"op": "tts.speak", "text": "hello", "cameras": ["front"]}
+            )
+            await asyncio.wait_for(queue.worker, 3)
             identifier = queue.enqueue("hello", ["front"], DEFAULT_VOICE)
-            await queue.worker
-        self.assertEqual(self.played, [(SPEECH, ("front",))])
-        receipt = queue.job_status(identifier)
-        self.assertEqual(set(receipt), SPEECH_KEYS)
-        self.assertEqual(receipt["state"], "completed")
-        self.assertNotIn("chime", receipt)
+            await asyncio.wait_for(queue.worker, 3)
+        self.assertEqual(self.played, [(SPEECH, ("front",)), (SPEECH, ("front",))])
+        for job in (result["queued_job"], identifier):
+            with self.subTest(job=job):
+                receipt = queue.job_status(job)
+                self.assertEqual(set(receipt), SPEECH_KEYS)
+                self.assertEqual(receipt["state"], "completed")
 
-    async def test_cancelling_synthesis_never_plays_a_chime_alone(self):
+    async def test_cancelling_synthesis_never_plays_a_cue(self):
         queue = self.bridge.speech
         started = asyncio.Event()
 
@@ -126,7 +179,12 @@ class ChimeTests(unittest.IsolatedAsyncioTestCase):
             patch("hikvision_audio_bridge.server.synthesize", new=provider),
             self.recording_play(),
         ):
-            identifier = queue.enqueue("hello", ["front"], DEFAULT_VOICE, "error")
+            identifier = queue.enqueue(
+                "hello",
+                ["front"],
+                DEFAULT_VOICE,
+                {"tone": "error", "duration": "short"},
+            )
             worker = queue.worker
             await asyncio.wait_for(started.wait(), 3)
             await queue.cancel(identifier)

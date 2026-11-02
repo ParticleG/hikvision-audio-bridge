@@ -231,32 +231,43 @@ convert MP3 to PCM16. Text and synthesized audio are kept in memory, never audio
 - Status exposes job IDs, targets, voices and outcomes, not announcement text.
   Completion tracks camera-transport consumption, not the camera's internal speaker buffer.
 
-Automation clients may add an optional `chime` field to `tts.speak` (`success`,
-`warning` or `error`; server 0.2.2 or newer) to sound a status cue before the
-spoken text:
+Automation clients may add optional `chime` and `plays` fields to `tts.speak`
+(server 0.3.0 or newer).
+`chime` selects a status cue and must be an object with exactly two string
+fields: `tone` (`success`, `attention`, `alert`, `warning` or `error`) and
+`duration` (`short`, `medium` or `long`). `plays` is the total number of times
+the complete announcement plays, from 1 to 5 and defaulting to 1:
 
 ```json
-{"op":"tts.speak","text":"Door opened","cameras":["entrance"],"chime":"success"}
+{"op":"tts.speak","text":"Door opened","cameras":["entrance"],
+ "chime":{"tone":"success","duration":"short"},"plays":2}
 ```
 
-Omitting `chime` keeps the earlier speech-only behaviour, so existing clients are
-unchanged. Unknown names and non-string values are rejected before the job is
-queued; `chime` is not echoed in job status. The cue is a packaged 8 kHz mono
-PCM16 WAV followed by 200 ms of silence, prepended to the synthesized speech in
-the same queue job and the same camera upload. It therefore obeys normal FIFO
-order, target selection, cancellation and transport-completion tracking, and a
-job cancelled before or during synthesis never plays the cue alone. The server
-does not download chimes or invoke FFmpeg to prepare them at runtime. An updated
-deployment must replace the installed package files: rerun
+Omitting both fields keeps the earlier speech-only behaviour byte for byte.
+Strings, missing or extra keys, non-string or unknown values, and `plays`
+outside 1-5 (including booleans, floats and strings) are rejected before the
+job is queued. Neither field is echoed in job status or completion receipts.
+Server 0.2.2 accepted only the string chimes `success`, `warning` and `error`;
+0.3.0 rejects them, so upgrade clients that send `chime` together with the server.
+
+One pass is the packaged cue followed by 200 ms of silence (only when `chime`
+is present), then the synthesized speech. Passes are joined by exactly 1 s of
+silence, with no leading or trailing silence, and speech is synthesized once
+per job. The cue, gaps and speech are played as a single queue job in a single
+camera upload, so they obey normal FIFO order, target selection, cancellation
+and transport-completion tracking. Cancelling during synthesis never plays a
+cue, and cancelling during the first cue never sends speech.
+
+The cues are packaged 8 kHz mono PCM16 WAVs rendered offline with Tone.js from
+Tyler Stiene's MIT-licensed simple-notification-sounds library
+(<https://github.com/Stieneee/simple-notification-sounds>); the license and
+rendering details are kept in
+`src/hikvision_audio_bridge/chimes/ATTRIBUTION.md` and `LICENSE.txt`. The
+server does not download, synthesize or FFmpeg-convert cues at runtime. An
+updated deployment must replace the installed package files: rerun
 `uv sync --frozen --no-dev --no-editable` in `/opt/hikvision-audio` for the
 server or `uv tool install --reinstall .` for the desktop. A running service
 still needs its normal restart before the new code is loaded.
-
-The WAV cues derive from Kenney's "Interface Sounds" pack
-(<https://kenney.nl/assets/interface-sounds>), released under CC0 1.0, so no
-attribution is required and no CC-BY obligations apply. Original asset names,
-conversion commands and the pack's license text are kept in
-`src/hikvision_audio_bridge/chimes/ATTRIBUTION.md` and `LICENSE.txt`.
 
 Automation clients can use `POST /api/command` with `{"op":"tts.get","id":"JOB_ID"}`
 and the admin bearer token to follow one queued job (server 0.2.1 or newer).
